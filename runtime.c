@@ -791,7 +791,7 @@ static JSObjectRef create_fs_module(JSContextRef ctx) {
     return fs;
 }
 
-// Console.log implementation
+// Console.log implementation (stdout)
 static JSValueRef js_console_log(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
                                   const JSValueRef arguments[], JSValueRef* exception) {
@@ -810,6 +810,30 @@ static JSValueRef js_console_log(JSContextRef ctx, JSObjectRef function __attrib
         JSStringRelease(js_string);
     }
     printf("\n");
+    fflush(stdout);
+    return JSValueMakeUndefined(ctx);
+}
+
+// Console.error/warn implementation (stderr)
+static JSValueRef js_console_error(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                    JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                    const JSValueRef arguments[], JSValueRef* exception) {
+    for (size_t i = 0; i < argumentCount; i++) {
+        JSStringRef js_string = JSValueToStringCopy(ctx, arguments[i], exception);
+        if (*exception) return JSValueMakeUndefined(ctx);
+
+        size_t max_size = JSStringGetMaximumUTF8CStringSize(js_string);
+        char* buffer = malloc(max_size);
+        JSStringGetUTF8CString(js_string, buffer, max_size);
+
+        fprintf(stderr, "%s", buffer);
+        if (i < argumentCount - 1) fprintf(stderr, " ");
+
+        free(buffer);
+        JSStringRelease(js_string);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
     return JSValueMakeUndefined(ctx);
 }
 
@@ -1032,10 +1056,30 @@ static JSValueRef js_process_chdir(JSContextRef ctx, JSObjectRef function __attr
 
 void setup_console(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef console = JSObjectMake(ctx, NULL, NULL);
+
+    // console.log
     JSStringRef log_name = JSStringCreateWithUTF8CString("log");
     JSObjectRef log_func = JSObjectMakeFunctionWithCallback(ctx, log_name, js_console_log);
     JSObjectSetProperty(ctx, console, log_name, log_func, kJSPropertyAttributeNone, NULL);
     JSStringRelease(log_name);
+
+    // console.error
+    JSStringRef error_name = JSStringCreateWithUTF8CString("error");
+    JSObjectRef error_func = JSObjectMakeFunctionWithCallback(ctx, error_name, js_console_error);
+    JSObjectSetProperty(ctx, console, error_name, error_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(error_name);
+
+    // console.warn (same as error)
+    JSStringRef warn_name = JSStringCreateWithUTF8CString("warn");
+    JSObjectRef warn_func = JSObjectMakeFunctionWithCallback(ctx, warn_name, js_console_error);
+    JSObjectSetProperty(ctx, console, warn_name, warn_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(warn_name);
+
+    // console.debug (same as log)
+    JSStringRef debug_name = JSStringCreateWithUTF8CString("debug");
+    JSObjectRef debug_func = JSObjectMakeFunctionWithCallback(ctx, debug_name, js_console_log);
+    JSObjectSetProperty(ctx, console, debug_name, debug_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(debug_name);
 
     JSStringRef console_name = JSStringCreateWithUTF8CString("console");
     JSObjectSetProperty(ctx, global, console_name, console, kJSPropertyAttributeNone, NULL);
@@ -1300,15 +1344,23 @@ static JSValueRef js_krandog_import(JSContextRef ctx, JSObjectRef function __att
 }
 
 // Transpile ES module to executable code
-static char* transpile_es_module(const char* source) {
+static char* transpile_es_module(const char* source, const char* filepath) {
     size_t source_len = strlen(source);
     size_t buffer_size = source_len * 10 + 10000; // Large buffer for transpiled code
     char* transpiled = malloc(buffer_size);
     char* out = transpiled;
 
+    // Get dirname from filepath
+    char* filepath_copy = strdup(filepath);
+    char* dir = dirname(filepath_copy);
+
     out += sprintf(out, "(function() {\n");
+    out += sprintf(out, "const __filename = '%s';\n", filepath);
+    out += sprintf(out, "const __dirname = '%s';\n", dir);
     out += sprintf(out, "const __exports = {};\n");
     out += sprintf(out, "const __default = { value: undefined };\n\n");
+
+    free(filepath_copy);
 
     // Track exported names for later assignment
     char exported_names[50][256];
@@ -1539,7 +1591,7 @@ static JSValueRef load_es_module(JSContextRef ctx, const char* path, JSValueRef*
     strncpy(current_dir, module_dir, PATH_MAX);
 
     // Transpile and execute
-    char* transpiled = transpile_es_module(source);
+    char* transpiled = transpile_es_module(source, path);
     free(source);
 
     JSStringRef js_code = JSStringCreateWithUTF8CString(transpiled);
@@ -1626,12 +1678,30 @@ int main(int argc, char* argv[]) {
     int is_module = strstr(source, "import ") != NULL || strstr(source, "export ") != NULL;
 
     if (is_module) {
-        char* transpiled = transpile_es_module(source);
+        char* transpiled = transpile_es_module(source, script_path);
         JSStringRef js_code = JSStringCreateWithUTF8CString(transpiled);
         JSEvaluateScript(ctx, js_code, NULL, NULL, 1, &exception);
         JSStringRelease(js_code);
         free(transpiled);
     } else {
+        // Set __dirname and __filename for non-module scripts
+        char* script_dir_copy = strdup(script_path);
+        char* dir = dirname(script_dir_copy);
+
+        JSStringRef dirname_name = JSStringCreateWithUTF8CString("__dirname");
+        JSStringRef dirname_value = JSStringCreateWithUTF8CString(dir);
+        JSObjectSetProperty(ctx, global, dirname_name, JSValueMakeString(ctx, dirname_value), kJSPropertyAttributeNone, NULL);
+        JSStringRelease(dirname_name);
+        JSStringRelease(dirname_value);
+
+        JSStringRef filename_name = JSStringCreateWithUTF8CString("__filename");
+        JSStringRef filename_value = JSStringCreateWithUTF8CString(script_path);
+        JSObjectSetProperty(ctx, global, filename_name, JSValueMakeString(ctx, filename_value), kJSPropertyAttributeNone, NULL);
+        JSStringRelease(filename_name);
+        JSStringRelease(filename_value);
+
+        free(script_dir_copy);
+
         JSStringRef js_code = JSStringCreateWithUTF8CString(source);
         JSEvaluateScript(ctx, js_code, NULL, NULL, 1, &exception);
         JSStringRelease(js_code);
