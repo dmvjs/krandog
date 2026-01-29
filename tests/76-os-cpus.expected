@@ -1,0 +1,4 @@
+cpus is array: true
+cpus length: true
+cpu has model: true
+cpu has speed: true

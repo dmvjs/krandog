@@ -1,0 +1,7 @@
+platform is string: true
+platform length: true
+arch is string: true
+arch length: true
+type is string: true
+type length: true
+EOL exists: true

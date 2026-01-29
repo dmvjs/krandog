@@ -1,0 +1,8 @@
+protocol: https:
+hostname: example.com
+port: 8080
+pathname: /path/to/page
+query: foo=bar&baz=qux
+hash: #section
+simple protocol: http:
+simple pathname: /test

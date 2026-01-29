@@ -1,0 +1,5 @@
+socket created: true
+socket has bind: true
+socket has send: true
+socket has close: true
+socket closed

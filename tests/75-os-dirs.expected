@@ -1,0 +1,7 @@
+homedir is string: true
+homedir length: true
+homedir starts with slash: true
+tmpdir is string: true
+tmpdir length: true
+hostname is string: true
+hostname length: true

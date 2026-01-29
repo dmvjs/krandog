@@ -1,0 +1,4 @@
+hmac length: 64
+hmac starts with: 287a3bd8
+same message same result: true
+different key different result: true

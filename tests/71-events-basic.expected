@@ -1,0 +1,5 @@
+listener count: 2
+received: hello
+second listener: hello
+received: world
+second listener: world
