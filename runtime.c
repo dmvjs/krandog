@@ -21,6 +21,8 @@
 #include <sys/sysctl.h>
 #include <Security/Security.h>
 #include <Security/SecureTransport.h>
+#include <netdb.h>
+#include <zlib.h>
 
 // Module cache
 static JSObjectRef module_cache = NULL;
@@ -3063,6 +3065,470 @@ static JSObjectRef create_https_module(JSContextRef ctx) {
     return https;
 }
 
+// dns.lookup() implementation
+static JSValueRef js_dns_lookup(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 2) {
+        JSStringRef error = JSStringCreateWithUTF8CString("lookup requires hostname and callback");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get hostname
+    JSStringRef hostname_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(hostname_str);
+    char* hostname = malloc(max_size);
+    JSStringGetUTF8CString(hostname_str, hostname, max_size);
+    JSStringRelease(hostname_str);
+
+    // Get callback
+    JSObjectRef callback = JSValueToObject(ctx, arguments[1], exception);
+    if (*exception) {
+        free(hostname);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Resolve hostname
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;  // IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo* result = NULL;
+    int status = getaddrinfo(hostname, NULL, &hints, &result);
+
+    if (status != 0) {
+        // Call callback with error
+        JSStringRef error_msg = JSStringCreateWithUTF8CString(gai_strerror(status));
+        JSValueRef error_val = JSValueMakeString(ctx, error_msg);
+        JSStringRelease(error_msg);
+
+        JSValueRef args[] = {error_val, JSValueMakeNull(ctx)};
+        JSObjectCallAsFunction(ctx, callback, NULL, 2, args, NULL);
+
+        free(hostname);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get first IP address
+    char ip_str[INET6_ADDRSTRLEN];
+    void* addr_ptr = NULL;
+
+    if (result->ai_family == AF_INET) {
+        struct sockaddr_in* ipv4 = (struct sockaddr_in*)result->ai_addr;
+        addr_ptr = &(ipv4->sin_addr);
+    } else {
+        struct sockaddr_in6* ipv6 = (struct sockaddr_in6*)result->ai_addr;
+        addr_ptr = &(ipv6->sin6_addr);
+    }
+
+    inet_ntop(result->ai_family, addr_ptr, ip_str, sizeof(ip_str));
+    int family = result->ai_family == AF_INET ? 4 : 6;
+
+    freeaddrinfo(result);
+    free(hostname);
+
+    // Call callback(null, address, family)
+    JSStringRef ip_js = JSStringCreateWithUTF8CString(ip_str);
+    JSValueRef ip_val = JSValueMakeString(ctx, ip_js);
+    JSStringRelease(ip_js);
+
+    JSValueRef args[] = {JSValueMakeNull(ctx), ip_val, JSValueMakeNumber(ctx, family)};
+    JSObjectCallAsFunction(ctx, callback, NULL, 3, args, NULL);
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// Create dns module object
+static JSObjectRef create_dns_module(JSContextRef ctx) {
+    JSObjectRef dns = JSObjectMake(ctx, NULL, NULL);
+
+    // dns.lookup()
+    JSStringRef lookup_name = JSStringCreateWithUTF8CString("lookup");
+    JSObjectRef lookup_func = JSObjectMakeFunctionWithCallback(ctx, lookup_name, js_dns_lookup);
+    JSObjectSetProperty(ctx, dns, lookup_name, lookup_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(lookup_name);
+
+    return dns;
+}
+
+// UDP Socket structure
+typedef struct UdpSocket {
+    int socket_fd;
+    JSObjectRef on_message;
+    JSObjectRef on_error;
+    struct UdpSocket* next;
+} UdpSocket;
+
+static UdpSocket* udp_socket_list = NULL;
+
+// dgram.createSocket() implementation
+static JSValueRef js_dgram_create_socket(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                         JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                         const JSValueRef arguments[], JSValueRef* exception) {
+    // Get socket type (udp4 or udp6)
+    int family = AF_INET;  // Default to IPv4
+    if (argumentCount > 0) {
+        JSStringRef type_str = JSValueToStringCopy(ctx, arguments[0], exception);
+        if (*exception) return JSValueMakeUndefined(ctx);
+
+        char type[16];
+        JSStringGetUTF8CString(type_str, type, sizeof(type));
+        JSStringRelease(type_str);
+
+        if (strcmp(type, "udp6") == 0) {
+            family = AF_INET6;
+        }
+    }
+
+    // Create UDP socket
+    int sock_fd = socket(family, SOCK_DGRAM, 0);
+    if (sock_fd < 0) {
+        JSStringRef error = JSStringCreateWithUTF8CString("Failed to create UDP socket");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Set non-blocking
+    fcntl(sock_fd, F_SETFL, O_NONBLOCK);
+
+    // Create UdpSocket structure
+    UdpSocket* udp_sock = malloc(sizeof(UdpSocket));
+    udp_sock->socket_fd = sock_fd;
+    udp_sock->on_message = NULL;
+    udp_sock->on_error = NULL;
+    udp_sock->next = udp_socket_list;
+    udp_socket_list = udp_sock;
+
+    // Create socket object
+    const char* socket_code =
+        "(function(fd) {"
+        "  return {"
+        "    __udp_fd: fd,"
+        "    bind: function(port, address, callback) {"
+        "      __udp_bind(this.__udp_fd, port, address || '0.0.0.0');"
+        "      if (callback) callback();"
+        "    },"
+        "    send: function(msg, port, address, callback) {"
+        "      __udp_send(this.__udp_fd, msg, port, address);"
+        "      if (callback) callback();"
+        "    },"
+        "    on: function(event, handler) {"
+        "      if (event === 'message') __udp_on_message(this.__udp_fd, handler);"
+        "      if (event === 'error') __udp_on_error(this.__udp_fd, handler);"
+        "    },"
+        "    close: function() { __udp_close(this.__udp_fd); }"
+        "  };"
+        "})";
+
+    JSStringRef code_str = JSStringCreateWithUTF8CString(socket_code);
+    JSValueRef func_val = JSEvaluateScript(ctx, code_str, NULL, NULL, 1, NULL);
+    JSStringRelease(code_str);
+
+    JSObjectRef func = JSValueToObject(ctx, func_val, NULL);
+    JSValueRef args[] = {JSValueMakeNumber(ctx, (double)sock_fd)};
+    return JSObjectCallAsFunction(ctx, func, NULL, 1, args, NULL);
+}
+
+// __udp_bind helper
+static JSValueRef js_udp_bind(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                              JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                              const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 3) return JSValueMakeUndefined(ctx);
+
+    int sock_fd = (int)JSValueToNumber(ctx, arguments[0], NULL);
+    int port = (int)JSValueToNumber(ctx, arguments[1], NULL);
+
+    JSStringRef addr_str = JSValueToStringCopy(ctx, arguments[2], exception);
+    char address[256];
+    JSStringGetUTF8CString(addr_str, address, sizeof(address));
+    JSStringRelease(addr_str);
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, address, &addr.sin_addr);
+
+    if (bind(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        JSStringRef error = JSStringCreateWithUTF8CString("Failed to bind UDP socket");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+    }
+
+    // Initialize kqueue if needed and register socket
+    if (kq == -1) {
+        kq = kqueue();
+    }
+
+    struct kevent ev;
+    EV_SET(&ev, sock_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    kevent(kq, &ev, 1, NULL, 0, NULL);
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// __udp_send helper
+static JSValueRef js_udp_send(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                              JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                              const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 4) return JSValueMakeUndefined(ctx);
+
+    int sock_fd = (int)JSValueToNumber(ctx, arguments[0], NULL);
+
+    JSStringRef msg_str = JSValueToStringCopy(ctx, arguments[1], exception);
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(msg_str);
+    char* message = malloc(max_size);
+    JSStringGetUTF8CString(msg_str, message, max_size);
+    JSStringRelease(msg_str);
+
+    int port = (int)JSValueToNumber(ctx, arguments[2], NULL);
+
+    JSStringRef addr_str = JSValueToStringCopy(ctx, arguments[3], exception);
+    char address[256];
+    JSStringGetUTF8CString(addr_str, address, sizeof(address));
+    JSStringRelease(addr_str);
+
+    struct sockaddr_in dest_addr = {0};
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(port);
+    inet_pton(AF_INET, address, &dest_addr.sin_addr);
+
+    sendto(sock_fd, message, strlen(message), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+    free(message);
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// __udp_on_message helper
+static JSValueRef js_udp_on_message(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                    JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                    const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    if (argumentCount < 2) return JSValueMakeUndefined(ctx);
+
+    int sock_fd = (int)JSValueToNumber(ctx, arguments[0], NULL);
+    JSObjectRef handler = JSValueToObject(ctx, arguments[1], NULL);
+
+    // Find UDP socket and store handler
+    for (UdpSocket* sock = udp_socket_list; sock; sock = sock->next) {
+        if (sock->socket_fd == sock_fd) {
+            if (sock->on_message) JSValueUnprotect(global_ctx, sock->on_message);
+            sock->on_message = handler;
+            JSValueProtect(global_ctx, handler);
+            break;
+        }
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// __udp_on_error helper
+static JSValueRef js_udp_on_error(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                  JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                  const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    if (argumentCount < 2) return JSValueMakeUndefined(ctx);
+
+    int sock_fd = (int)JSValueToNumber(ctx, arguments[0], NULL);
+    JSObjectRef handler = JSValueToObject(ctx, arguments[1], NULL);
+
+    for (UdpSocket* sock = udp_socket_list; sock; sock = sock->next) {
+        if (sock->socket_fd == sock_fd) {
+            if (sock->on_error) JSValueUnprotect(global_ctx, sock->on_error);
+            sock->on_error = handler;
+            JSValueProtect(global_ctx, handler);
+            break;
+        }
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// __udp_close helper
+static JSValueRef js_udp_close(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                               JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                               const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    if (argumentCount < 1) return JSValueMakeUndefined(ctx);
+
+    int sock_fd = (int)JSValueToNumber(ctx, arguments[0], NULL);
+
+    // Remove from kqueue
+    struct kevent ev;
+    EV_SET(&ev, sock_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    kevent(kq, &ev, 1, NULL, 0, NULL);
+
+    close(sock_fd);
+
+    // Remove from list
+    UdpSocket** current = &udp_socket_list;
+    while (*current) {
+        if ((*current)->socket_fd == sock_fd) {
+            UdpSocket* to_free = *current;
+            *current = (*current)->next;
+            if (to_free->on_message) JSValueUnprotect(global_ctx, to_free->on_message);
+            if (to_free->on_error) JSValueUnprotect(global_ctx, to_free->on_error);
+            free(to_free);
+            break;
+        }
+        current = &(*current)->next;
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// Create dgram module object
+static JSObjectRef create_dgram_module(JSContextRef ctx) {
+    JSObjectRef dgram = JSObjectMake(ctx, NULL, NULL);
+
+    // dgram.createSocket()
+    JSStringRef createSocket_name = JSStringCreateWithUTF8CString("createSocket");
+    JSObjectRef createSocket_func = JSObjectMakeFunctionWithCallback(ctx, createSocket_name, js_dgram_create_socket);
+    JSObjectSetProperty(ctx, dgram, createSocket_name, createSocket_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(createSocket_name);
+
+    return dgram;
+}
+
+// zlib.gzip() implementation
+static JSValueRef js_zlib_gzip(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                               JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                               const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 2) {
+        JSStringRef error = JSStringCreateWithUTF8CString("gzip requires data and callback");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get input data
+    JSStringRef data_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(data_str);
+    char* data = malloc(max_size);
+    JSStringGetUTF8CString(data_str, data, max_size);
+    JSStringRelease(data_str);
+
+    size_t data_len = strlen(data);
+
+    // Get callback
+    JSObjectRef callback = JSValueToObject(ctx, arguments[1], exception);
+    if (*exception) {
+        free(data);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Compress data
+    uLongf compressed_size = compressBound(data_len);
+    unsigned char* compressed = malloc(compressed_size);
+
+    int result = compress2(compressed, &compressed_size, (const unsigned char*)data, data_len, Z_DEFAULT_COMPRESSION);
+    free(data);
+
+    if (result != Z_OK) {
+        free(compressed);
+        JSStringRef error = JSStringCreateWithUTF8CString("Compression failed");
+        JSValueRef error_val = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+
+        JSValueRef args[] = {error_val, JSValueMakeNull(ctx)};
+        JSObjectCallAsFunction(ctx, callback, NULL, 2, args, NULL);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Convert to string (base64 would be better, but for now just binary)
+    JSStringRef compressed_str = JSStringCreateWithUTF8CString((char*)compressed);
+    JSValueRef compressed_val = JSValueMakeString(ctx, compressed_str);
+    JSStringRelease(compressed_str);
+    free(compressed);
+
+    // Call callback(null, compressed)
+    JSValueRef args[] = {JSValueMakeNull(ctx), compressed_val};
+    JSObjectCallAsFunction(ctx, callback, NULL, 2, args, NULL);
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// zlib.gunzip() implementation
+static JSValueRef js_zlib_gunzip(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                 JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                 const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 2) {
+        JSStringRef error = JSStringCreateWithUTF8CString("gunzip requires data and callback");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get input data
+    JSStringRef data_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(data_str);
+    unsigned char* data = malloc(max_size);
+    JSStringGetUTF8CString(data_str, (char*)data, max_size);
+    size_t data_len = strlen((char*)data);
+    JSStringRelease(data_str);
+
+    // Get callback
+    JSObjectRef callback = JSValueToObject(ctx, arguments[1], exception);
+    if (*exception) {
+        free(data);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Decompress data (assume 10x expansion)
+    uLongf decompressed_size = data_len * 10;
+    unsigned char* decompressed = malloc(decompressed_size);
+
+    int result = uncompress(decompressed, &decompressed_size, data, data_len);
+    free(data);
+
+    if (result != Z_OK) {
+        free(decompressed);
+        JSStringRef error = JSStringCreateWithUTF8CString("Decompression failed");
+        JSValueRef error_val = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+
+        JSValueRef args[] = {error_val, JSValueMakeNull(ctx)};
+        JSObjectCallAsFunction(ctx, callback, NULL, 2, args, NULL);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    decompressed[decompressed_size] = '\0';
+    JSStringRef decompressed_str = JSStringCreateWithUTF8CString((char*)decompressed);
+    JSValueRef decompressed_val = JSValueMakeString(ctx, decompressed_str);
+    JSStringRelease(decompressed_str);
+    free(decompressed);
+
+    // Call callback(null, decompressed)
+    JSValueRef args[] = {JSValueMakeNull(ctx), decompressed_val};
+    JSObjectCallAsFunction(ctx, callback, NULL, 2, args, NULL);
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// Create zlib module object
+static JSObjectRef create_zlib_module(JSContextRef ctx) {
+    JSObjectRef zlib = JSObjectMake(ctx, NULL, NULL);
+
+    // zlib.gzip()
+    JSStringRef gzip_name = JSStringCreateWithUTF8CString("gzip");
+    JSObjectRef gzip_func = JSObjectMakeFunctionWithCallback(ctx, gzip_name, js_zlib_gzip);
+    JSObjectSetProperty(ctx, zlib, gzip_name, gzip_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(gzip_name);
+
+    // zlib.gunzip()
+    JSStringRef gunzip_name = JSStringCreateWithUTF8CString("gunzip");
+    JSObjectRef gunzip_func = JSObjectMakeFunctionWithCallback(ctx, gunzip_name, js_zlib_gunzip);
+    JSObjectSetProperty(ctx, zlib, gunzip_name, gunzip_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(gunzip_name);
+
+    return zlib;
+}
+
 // Generate WebSocket accept key from Sec-WebSocket-Key
 static void ws_generate_accept_key(const char* client_key, char* accept_key) {
     char combined[256];
@@ -4286,8 +4752,8 @@ void run_event_loop() {
         server = server->next;
     }
 
-    // Event loop runs if we have timers, servers, websockets, or TCP sockets
-    while (timer_queue || server_list || websocket_list || tcp_socket_list || tcp_server_list) {
+    // Event loop runs if we have timers, servers, websockets, TCP sockets, or UDP sockets
+    while (timer_queue || server_list || websocket_list || tcp_socket_list || tcp_server_list || udp_socket_list) {
         // Calculate timeout based on next timer
         struct timespec timeout;
         timeout.tv_sec = 0;
@@ -4541,6 +5007,69 @@ void run_event_loop() {
                             }
 
                             free(payload);
+                        }
+
+                        drain_microtasks();
+                        continue;
+                    }
+
+                    // Check if this is a UDP socket
+                    int is_udp = 0;
+                    UdpSocket* udp_sock = NULL;
+                    for (UdpSocket* sock = udp_socket_list; sock; sock = sock->next) {
+                        if (sock->socket_fd == (int)events[i].ident) {
+                            is_udp = 1;
+                            udp_sock = sock;
+                            break;
+                        }
+                    }
+
+                    if (is_udp && udp_sock) {
+                        // Receive UDP packet
+                        char buffer[8192];
+                        struct sockaddr_in from_addr;
+                        socklen_t from_len = sizeof(from_addr);
+
+                        ssize_t bytes = recvfrom(udp_sock->socket_fd, buffer, sizeof(buffer) - 1, 0,
+                                                (struct sockaddr*)&from_addr, &from_len);
+
+                        if (bytes > 0 && udp_sock->on_message) {
+                            buffer[bytes] = '\0';
+
+                            // Convert address to string
+                            char from_ip[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, &from_addr.sin_addr, from_ip, sizeof(from_ip));
+
+                            // Create message buffer
+                            JSStringRef msg_str = JSStringCreateWithUTF8CString(buffer);
+                            JSValueRef msg_val = JSValueMakeString(global_ctx, msg_str);
+                            JSStringRelease(msg_str);
+
+                            // Create rinfo object {address, port, family}
+                            JSObjectRef rinfo = JSObjectMake(global_ctx, NULL, NULL);
+
+                            JSStringRef addr_name = JSStringCreateWithUTF8CString("address");
+                            JSStringRef addr_val = JSStringCreateWithUTF8CString(from_ip);
+                            JSObjectSetProperty(global_ctx, rinfo, addr_name, JSValueMakeString(global_ctx, addr_val),
+                                              kJSPropertyAttributeNone, NULL);
+                            JSStringRelease(addr_name);
+                            JSStringRelease(addr_val);
+
+                            JSStringRef port_name = JSStringCreateWithUTF8CString("port");
+                            JSObjectSetProperty(global_ctx, rinfo, port_name, JSValueMakeNumber(global_ctx, ntohs(from_addr.sin_port)),
+                                              kJSPropertyAttributeNone, NULL);
+                            JSStringRelease(port_name);
+
+                            JSStringRef family_name = JSStringCreateWithUTF8CString("family");
+                            JSStringRef family_val = JSStringCreateWithUTF8CString("IPv4");
+                            JSObjectSetProperty(global_ctx, rinfo, family_name, JSValueMakeString(global_ctx, family_val),
+                                              kJSPropertyAttributeNone, NULL);
+                            JSStringRelease(family_name);
+                            JSStringRelease(family_val);
+
+                            // Call handler(msg, rinfo)
+                            JSValueRef args[] = {msg_val, rinfo};
+                            JSObjectCallAsFunction(global_ctx, udp_sock->on_message, NULL, 2, args, NULL);
                         }
 
                         drain_microtasks();
@@ -5019,7 +5548,8 @@ static JSValueRef js_krandog_import(JSContextRef ctx, JSObjectRef function __att
         strcmp(actual_module, "net") == 0 || strcmp(actual_module, "url") == 0 ||
         strcmp(actual_module, "util") == 0 || strcmp(actual_module, "events") == 0 ||
         strcmp(actual_module, "os") == 0 || strcmp(actual_module, "http") == 0 ||
-        strcmp(actual_module, "https") == 0) {
+        strcmp(actual_module, "https") == 0 || strcmp(actual_module, "dns") == 0 ||
+        strcmp(actual_module, "dgram") == 0 || strcmp(actual_module, "zlib") == 0) {
         JSValueRef result = load_es_module(ctx, actual_module, exception);
         free(module_path);
         return result;
@@ -5231,7 +5761,8 @@ static JSValueRef load_es_module(JSContextRef ctx, const char* path, JSValueRef*
     if (strcmp(path, "fs") == 0 || strcmp(path, "path") == 0 || strcmp(path, "child_process") == 0 ||
         strcmp(path, "crypto") == 0 || strcmp(path, "net") == 0 || strcmp(path, "url") == 0 ||
         strcmp(path, "util") == 0 || strcmp(path, "events") == 0 || strcmp(path, "os") == 0 ||
-        strcmp(path, "http") == 0 || strcmp(path, "https") == 0) {
+        strcmp(path, "http") == 0 || strcmp(path, "https") == 0 || strcmp(path, "dns") == 0 ||
+        strcmp(path, "dgram") == 0 || strcmp(path, "zlib") == 0) {
         JSStringRef cache_key = JSStringCreateWithUTF8CString(path);
         JSValueRef cached = JSObjectGetProperty(ctx, module_cache, cache_key, NULL);
 
@@ -5261,6 +5792,12 @@ static JSValueRef load_es_module(JSContextRef ctx, const char* path, JSValueRef*
             builtin_module = create_http_module(ctx);
         } else if (strcmp(path, "https") == 0) {
             builtin_module = create_https_module(ctx);
+        } else if (strcmp(path, "dns") == 0) {
+            builtin_module = create_dns_module(ctx);
+        } else if (strcmp(path, "dgram") == 0) {
+            builtin_module = create_dgram_module(ctx);
+        } else if (strcmp(path, "zlib") == 0) {
+            builtin_module = create_zlib_module(ctx);
         } else {
             builtin_module = create_child_process_module(ctx);
         }
@@ -5418,6 +5955,32 @@ int main(int argc, char* argv[]) {
     JSObjectRef stream_end_func = JSObjectMakeFunctionWithCallback(ctx, stream_end_name, js_stream_end);
     JSObjectSetProperty(ctx, global, stream_end_name, stream_end_func, kJSPropertyAttributeNone, NULL);
     JSStringRelease(stream_end_name);
+
+    // Setup UDP helpers
+    JSStringRef udp_bind_name = JSStringCreateWithUTF8CString("__udp_bind");
+    JSObjectRef udp_bind_func = JSObjectMakeFunctionWithCallback(ctx, udp_bind_name, js_udp_bind);
+    JSObjectSetProperty(ctx, global, udp_bind_name, udp_bind_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(udp_bind_name);
+
+    JSStringRef udp_send_name = JSStringCreateWithUTF8CString("__udp_send");
+    JSObjectRef udp_send_func = JSObjectMakeFunctionWithCallback(ctx, udp_send_name, js_udp_send);
+    JSObjectSetProperty(ctx, global, udp_send_name, udp_send_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(udp_send_name);
+
+    JSStringRef udp_on_message_name = JSStringCreateWithUTF8CString("__udp_on_message");
+    JSObjectRef udp_on_message_func = JSObjectMakeFunctionWithCallback(ctx, udp_on_message_name, js_udp_on_message);
+    JSObjectSetProperty(ctx, global, udp_on_message_name, udp_on_message_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(udp_on_message_name);
+
+    JSStringRef udp_on_error_name = JSStringCreateWithUTF8CString("__udp_on_error");
+    JSObjectRef udp_on_error_func = JSObjectMakeFunctionWithCallback(ctx, udp_on_error_name, js_udp_on_error);
+    JSObjectSetProperty(ctx, global, udp_on_error_name, udp_on_error_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(udp_on_error_name);
+
+    JSStringRef udp_close_name = JSStringCreateWithUTF8CString("__udp_close");
+    JSObjectRef udp_close_func = JSObjectMakeFunctionWithCallback(ctx, udp_close_name, js_udp_close);
+    JSObjectSetProperty(ctx, global, udp_close_name, udp_close_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(udp_close_name);
 
     JSValueRef exception = NULL;
 
