@@ -1,0 +1,6 @@
+PASS: Finally called after resolve
+PASS: Finally called after reject
+PASS: Resolved value preserved
+PASS: Rejected reason preserved
+PASS: Finally with promise completed
+Promise.finally tests passed

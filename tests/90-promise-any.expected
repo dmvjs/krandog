@@ -1,0 +1,4 @@
+PASS: First fulfilled promise won
+PASS: Immediate value won
+PASS: All rejections handled
+Promise.any tests passed

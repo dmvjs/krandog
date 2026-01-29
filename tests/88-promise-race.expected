@@ -1,0 +1,4 @@
+PASS: Fastest promise won
+PASS: Immediate value won
+PASS: First rejection propagated
+Promise.race tests passed

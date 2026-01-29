@@ -7997,6 +7997,132 @@ int main(int argc, char* argv[]) {
     JSObjectSetProperty(ctx, global, udp_close_name, udp_close_func, kJSPropertyAttributeNone, NULL);
     JSStringRelease(udp_close_name);
 
+    // Setup Promise utilities (Promise.all, Promise.race, Promise.allSettled, Promise.any, Promise.prototype.finally)
+    const char* promise_utils =
+        "if (typeof Promise !== 'undefined') {"
+        // Promise.all - resolves when all promises resolve, rejects if any reject
+        "  if (!Promise.all) {"
+        "    Promise.all = function(promises) {"
+        "      return new Promise((resolve, reject) => {"
+        "        if (!Array.isArray(promises)) {"
+        "          return reject(new TypeError('Promise.all expects an array'));"
+        "        }"
+        "        if (promises.length === 0) {"
+        "          return resolve([]);"
+        "        }"
+        "        let results = [];"
+        "        let completed = 0;"
+        "        promises.forEach((promise, index) => {"
+        "          Promise.resolve(promise).then(value => {"
+        "            results[index] = value;"
+        "            completed++;"
+        "            if (completed === promises.length) {"
+        "              resolve(results);"
+        "            }"
+        "          }, reject);"
+        "        });"
+        "      });"
+        "    };"
+        "  }"
+        // Promise.race - resolves/rejects with the first promise to settle
+        "  if (!Promise.race) {"
+        "    Promise.race = function(promises) {"
+        "      return new Promise((resolve, reject) => {"
+        "        if (!Array.isArray(promises)) {"
+        "          return reject(new TypeError('Promise.race expects an array'));"
+        "        }"
+        "        if (promises.length === 0) {"
+        "          return;"
+        "        }"
+        "        promises.forEach(promise => {"
+        "          Promise.resolve(promise).then(resolve, reject);"
+        "        });"
+        "      });"
+        "    };"
+        "  }"
+        // Promise.allSettled - waits for all promises to settle (resolve or reject)
+        "  if (!Promise.allSettled) {"
+        "    Promise.allSettled = function(promises) {"
+        "      return new Promise((resolve) => {"
+        "        if (!Array.isArray(promises)) {"
+        "          return resolve([]);"
+        "        }"
+        "        if (promises.length === 0) {"
+        "          return resolve([]);"
+        "        }"
+        "        let results = [];"
+        "        let completed = 0;"
+        "        promises.forEach((promise, index) => {"
+        "          Promise.resolve(promise).then("
+        "            value => {"
+        "              results[index] = { status: 'fulfilled', value: value };"
+        "              completed++;"
+        "              if (completed === promises.length) {"
+        "                resolve(results);"
+        "              }"
+        "            },"
+        "            reason => {"
+        "              results[index] = { status: 'rejected', reason: reason };"
+        "              completed++;"
+        "              if (completed === promises.length) {"
+        "                resolve(results);"
+        "              }"
+        "            }"
+        "          );"
+        "        });"
+        "      });"
+        "    };"
+        "  }"
+        // Promise.any - resolves with the first promise to fulfill, rejects if all reject
+        "  if (!Promise.any) {"
+        "    Promise.any = function(promises) {"
+        "      return new Promise((resolve, reject) => {"
+        "        if (!Array.isArray(promises)) {"
+        "          return reject(new TypeError('Promise.any expects an array'));"
+        "        }"
+        "        if (promises.length === 0) {"
+        "          return reject(new AggregateError([], 'All promises were rejected'));"
+        "        }"
+        "        let errors = [];"
+        "        let rejected = 0;"
+        "        promises.forEach((promise, index) => {"
+        "          Promise.resolve(promise).then(resolve, error => {"
+        "            errors[index] = error;"
+        "            rejected++;"
+        "            if (rejected === promises.length) {"
+        "              reject(new AggregateError(errors, 'All promises were rejected'));"
+        "            }"
+        "          });"
+        "        });"
+        "      });"
+        "    };"
+        "  }"
+        // Promise.prototype.finally - cleanup handler that runs regardless of outcome
+        "  if (!Promise.prototype.finally) {"
+        "    Promise.prototype.finally = function(onFinally) {"
+        "      return this.then("
+        "        value => Promise.resolve(onFinally()).then(() => value),"
+        "        reason => Promise.resolve(onFinally()).then(() => { throw reason; })"
+        "      );"
+        "    };"
+        "  }"
+        "}";
+
+    JSStringRef promise_utils_code = JSStringCreateWithUTF8CString(promise_utils);
+    JSValueRef promise_exception = NULL;
+    JSEvaluateScript(ctx, promise_utils_code, NULL, NULL, 1, &promise_exception);
+    JSStringRelease(promise_utils_code);
+
+    if (promise_exception) {
+        JSStringRef error_str = JSValueToStringCopy(ctx, promise_exception, NULL);
+        size_t max_size = JSStringGetMaximumUTF8CStringSize(error_str);
+        char* error_buf = malloc(max_size);
+        JSStringGetUTF8CString(error_str, error_buf, max_size);
+        fprintf(stderr, "Warning: Failed to initialize Promise utilities: %s\n", error_buf);
+        free(error_buf);
+        JSStringRelease(error_str);
+    }
+
     JSValueRef exception = NULL;
 
     // Check if it's an ES module

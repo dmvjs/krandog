@@ -1,0 +1,4 @@
+PASS: Empty array handled
+PASS: All promises settled correctly
+PASS: All rejections handled
+Promise.allSettled tests passed
