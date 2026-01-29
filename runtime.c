@@ -4266,6 +4266,982 @@ static JSObjectRef create_fs_module(JSContextRef ctx) {
     return fs;
 }
 
+// ============================================================================
+// Web APIs: TextEncoder, TextDecoder, URL, URLSearchParams, AbortController
+// ============================================================================
+
+// TextEncoder data structure
+typedef struct {
+    char encoding[16];  // Always "utf-8" for now
+} TextEncoderData;
+
+// TextEncoder finalizer
+static void text_encoder_finalize(JSObjectRef object) {
+    TextEncoderData* data = JSObjectGetPrivate(object);
+    if (data) {
+        free(data);
+    }
+}
+
+// TextEncoder.encode() method
+static JSValueRef js_text_encoder_encode(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                          JSObjectRef thisObject, size_t argumentCount,
+                                          const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1 || !JSValueIsString(ctx, arguments[0])) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Convert string to UTF-8 bytes
+    JSStringRef str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(str);
+    char* buffer = malloc(max_size);
+    size_t actual_size = JSStringGetUTF8CString(str, buffer, max_size);
+    JSStringRelease(str);
+
+    // Create Uint8Array with the bytes (actual_size - 1 excludes null terminator)
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSValueRef* byte_values = malloc(sizeof(JSValueRef) * (actual_size - 1));
+    for (size_t i = 0; i < actual_size - 1; i++) {
+        byte_values[i] = JSValueMakeNumber(ctx, (unsigned char)buffer[i]);
+    }
+    JSObjectRef array = JSObjectMakeArray(ctx, actual_size - 1, byte_values, NULL);
+    free(byte_values);
+    free(buffer);
+
+    // Create Uint8Array from array
+    JSStringRef temp_name = JSStringCreateWithUTF8CString("__temp_encoder_data");
+    JSObjectSetProperty(ctx, global, temp_name, array, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(temp_name);
+
+    JSStringRef code = JSStringCreateWithUTF8CString("new Uint8Array(__temp_encoder_data)");
+    JSValueRef result = JSEvaluateScript(ctx, code, NULL, NULL, 1, exception);
+    JSStringRelease(code);
+
+    return result;
+}
+
+// TextEncoder constructor
+static JSObjectRef js_text_encoder_constructor(JSContextRef ctx, JSObjectRef constructor __attribute__((unused)),
+                                                size_t argumentCount __attribute__((unused)),
+                                                const JSValueRef arguments[] __attribute__((unused)),
+                                                JSValueRef* exception __attribute__((unused))) {
+    // Create private data
+    TextEncoderData* data = malloc(sizeof(TextEncoderData));
+    strcpy(data->encoding, "utf-8");
+
+    // Create class with finalizer
+    JSClassDefinition class_def = kJSClassDefinitionEmpty;
+    class_def.finalize = text_encoder_finalize;
+    JSClassRef class = JSClassCreate(&class_def);
+    JSObjectRef instance = JSObjectMake(ctx, class, data);
+    JSClassRelease(class);
+
+    // Add encode method
+    JSStringRef encode_name = JSStringCreateWithUTF8CString("encode");
+    JSObjectRef encode_func = JSObjectMakeFunctionWithCallback(ctx, encode_name, js_text_encoder_encode);
+    JSObjectSetProperty(ctx, instance, encode_name, encode_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(encode_name);
+
+    // Add encoding property (read-only)
+    JSStringRef encoding_name = JSStringCreateWithUTF8CString("encoding");
+    JSStringRef encoding_val = JSStringCreateWithUTF8CString("utf-8");
+    JSObjectSetProperty(ctx, instance, encoding_name, JSValueMakeString(ctx, encoding_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(encoding_name);
+    JSStringRelease(encoding_val);
+
+    return instance;
+}
+
+// TextDecoder data structure
+typedef struct {
+    char encoding[16];
+} TextDecoderData;
+
+// TextDecoder finalizer
+static void text_decoder_finalize(JSObjectRef object) {
+    TextDecoderData* data = JSObjectGetPrivate(object);
+    if (data) {
+        free(data);
+    }
+}
+
+// TextDecoder.decode() method
+static JSValueRef js_text_decoder_decode(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                          JSObjectRef thisObject, size_t argumentCount,
+                                          const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeString(ctx, JSStringCreateWithUTF8CString(""));
+    }
+
+    JSObjectRef obj = JSValueToObject(ctx, arguments[0], exception);
+    if (*exception || !obj) return JSValueMakeUndefined(ctx);
+
+    // Get length property
+    JSStringRef length_name = JSStringCreateWithUTF8CString("length");
+    JSValueRef length_val = JSObjectGetProperty(ctx, obj, length_name, NULL);
+    JSStringRelease(length_name);
+
+    if (!JSValueIsNumber(ctx, length_val)) {
+        return JSValueMakeString(ctx, JSStringCreateWithUTF8CString(""));
+    }
+
+    size_t length = (size_t)JSValueToNumber(ctx, length_val, NULL);
+    if (length == 0) {
+        return JSValueMakeString(ctx, JSStringCreateWithUTF8CString(""));
+    }
+
+    // Extract bytes from array/buffer
+    char* buffer = malloc(length + 1);
+    for (size_t i = 0; i < length; i++) {
+        JSValueRef val = JSObjectGetPropertyAtIndex(ctx, obj, i, NULL);
+        buffer[i] = (char)JSValueToNumber(ctx, val, NULL);
+    }
+    buffer[length] = '\0';
+
+    // Create JavaScript string from UTF-8 bytes
+    JSStringRef result_str = JSStringCreateWithUTF8CString(buffer);
+    JSValueRef result = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(buffer);
+
+    return result;
+}
+
+// TextDecoder constructor
+static JSObjectRef js_text_decoder_constructor(JSContextRef ctx, JSObjectRef constructor __attribute__((unused)),
+                                                size_t argumentCount,
+                                                const JSValueRef arguments[], JSValueRef* exception) {
+    // Get encoding (default to utf-8)
+    char encoding[16] = "utf-8";
+    if (argumentCount > 0 && JSValueIsString(ctx, arguments[0])) {
+        JSStringRef enc_str = JSValueToStringCopy(ctx, arguments[0], exception);
+        if (*exception) return NULL;
+        JSStringGetUTF8CString(enc_str, encoding, sizeof(encoding));
+        JSStringRelease(enc_str);
+    }
+
+    // Create private data
+    TextDecoderData* data = malloc(sizeof(TextDecoderData));
+    strncpy(data->encoding, encoding, sizeof(data->encoding) - 1);
+    data->encoding[sizeof(data->encoding) - 1] = '\0';
+
+    // Create class with finalizer
+    JSClassDefinition class_def = kJSClassDefinitionEmpty;
+    class_def.finalize = text_decoder_finalize;
+    JSClassRef class = JSClassCreate(&class_def);
+    JSObjectRef instance = JSObjectMake(ctx, class, data);
+    JSClassRelease(class);
+
+    // Add decode method
+    JSStringRef decode_name = JSStringCreateWithUTF8CString("decode");
+    JSObjectRef decode_func = JSObjectMakeFunctionWithCallback(ctx, decode_name, js_text_decoder_decode);
+    JSObjectSetProperty(ctx, instance, decode_name, decode_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(decode_name);
+
+    // Add encoding property (read-only)
+    JSStringRef encoding_name = JSStringCreateWithUTF8CString("encoding");
+    JSStringRef encoding_val = JSStringCreateWithUTF8CString(data->encoding);
+    JSObjectSetProperty(ctx, instance, encoding_name, JSValueMakeString(ctx, encoding_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(encoding_name);
+    JSStringRelease(encoding_val);
+
+    return instance;
+}
+
+// Base64 character table (reused from WebSocket accept key generation)
+static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Base64 decode lookup helper
+static int base64_decode_char(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    if (c == '=') return -1;  // Padding
+    return -2;  // Invalid
+}
+
+// btoa() - encode string to base64
+static JSValueRef js_btoa(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                          JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                          const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1 || !JSValueIsString(ctx, arguments[0])) {
+        JSStringRef error = JSStringCreateWithUTF8CString("btoa requires a string argument");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get input string
+    JSStringRef input_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(input_str);
+    char* input = malloc(max_size);
+    size_t input_len = JSStringGetUTF8CString(input_str, input, max_size);
+    JSStringRelease(input_str);
+    input_len--;  // Remove null terminator
+
+    // Calculate output size (4 chars for every 3 bytes, plus padding)
+    size_t output_len = ((input_len + 2) / 3) * 4;
+    char* output = malloc(output_len + 1);
+
+    size_t i = 0, j = 0;
+    while (i < input_len) {
+        unsigned int n = ((unsigned int)(unsigned char)input[i] << 16) |
+                         ((i + 1 < input_len) ? ((unsigned int)(unsigned char)input[i + 1] << 8) : 0) |
+                         ((i + 2 < input_len) ? (unsigned char)input[i + 2] : 0);
+
+        output[j++] = base64_chars[(n >> 18) & 63];
+        output[j++] = base64_chars[(n >> 12) & 63];
+        output[j++] = (i + 1 < input_len) ? base64_chars[(n >> 6) & 63] : '=';
+        output[j++] = (i + 2 < input_len) ? base64_chars[n & 63] : '=';
+
+        i += 3;
+    }
+    output[j] = '\0';
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(output);
+    JSValueRef result = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(input);
+    free(output);
+
+    return result;
+}
+
+// atob() - decode base64 to string
+static JSValueRef js_atob(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                          JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                          const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1 || !JSValueIsString(ctx, arguments[0])) {
+        JSStringRef error = JSStringCreateWithUTF8CString("atob requires a string argument");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get input string
+    JSStringRef input_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(input_str);
+    char* input = malloc(max_size);
+    size_t input_len = JSStringGetUTF8CString(input_str, input, max_size);
+    JSStringRelease(input_str);
+    input_len--;  // Remove null terminator
+
+    // Remove whitespace
+    char* clean_input = malloc(input_len + 1);
+    size_t clean_len = 0;
+    for (size_t i = 0; i < input_len; i++) {
+        if (input[i] != ' ' && input[i] != '\t' && input[i] != '\n' && input[i] != '\r') {
+            clean_input[clean_len++] = input[i];
+        }
+    }
+    clean_input[clean_len] = '\0';
+    free(input);
+
+    // Validate length (must be multiple of 4)
+    if (clean_len % 4 != 0) {
+        free(clean_input);
+        JSStringRef error = JSStringCreateWithUTF8CString("Invalid base64 string");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Calculate output size
+    size_t output_len = (clean_len / 4) * 3;
+    if (clean_len > 0 && clean_input[clean_len - 1] == '=') output_len--;
+    if (clean_len > 1 && clean_input[clean_len - 2] == '=') output_len--;
+
+    char* output = malloc(output_len + 1);
+    size_t i = 0, j = 0;
+
+    while (i < clean_len) {
+        int a = base64_decode_char(clean_input[i]);
+        int b = base64_decode_char(clean_input[i + 1]);
+        int c = base64_decode_char(clean_input[i + 2]);
+        int d = base64_decode_char(clean_input[i + 3]);
+
+        if (a < 0 || b < 0 || (c < -1) || (d < -1)) {
+            free(clean_input);
+            free(output);
+            JSStringRef error = JSStringCreateWithUTF8CString("Invalid base64 string");
+            *exception = JSValueMakeString(ctx, error);
+            JSStringRelease(error);
+            return JSValueMakeUndefined(ctx);
+        }
+
+        unsigned int n = (a << 18) | (b << 12) | ((c >= 0 ? c : 0) << 6) | (d >= 0 ? d : 0);
+
+        if (j < output_len) output[j++] = (n >> 16) & 0xFF;
+        if (j < output_len) output[j++] = (n >> 8) & 0xFF;
+        if (j < output_len) output[j++] = n & 0xFF;
+
+        i += 4;
+    }
+    output[j] = '\0';
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(output);
+    JSValueRef result = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(clean_input);
+    free(output);
+
+    return result;
+}
+
+// URL data structure
+typedef struct {
+    char protocol[64];
+    char hostname[256];
+    char port[16];
+    char pathname[1024];
+    char search[1024];
+    char hash[256];
+    char host[272];  // hostname + : + port
+    char href[2048];
+    char origin[320];  // protocol + // + host
+} URLData;
+
+// URL finalizer
+static void url_finalize(JSObjectRef object) {
+    URLData* data = JSObjectGetPrivate(object);
+    if (data) {
+        free(data);
+    }
+}
+
+// URL.toString() method
+static JSValueRef js_url_tostring(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                   JSObjectRef thisObject, size_t argumentCount __attribute__((unused)),
+                                   const JSValueRef arguments[] __attribute__((unused)),
+                                   JSValueRef* exception __attribute__((unused))) {
+    URLData* data = JSObjectGetPrivate(thisObject);
+    if (!data) return JSValueMakeUndefined(ctx);
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(data->href);
+    JSValueRef result = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    return result;
+}
+
+// URL.toJSON() method
+static JSValueRef js_url_tojson(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                 JSObjectRef thisObject, size_t argumentCount __attribute__((unused)),
+                                 const JSValueRef arguments[] __attribute__((unused)),
+                                 JSValueRef* exception __attribute__((unused))) {
+    return js_url_tostring(ctx, function, thisObject, argumentCount, arguments, exception);
+}
+
+// URL constructor
+static JSObjectRef js_url_constructor(JSContextRef ctx, JSObjectRef constructor __attribute__((unused)),
+                                       size_t argumentCount, const JSValueRef arguments[],
+                                       JSValueRef* exception) {
+    if (argumentCount < 1 || !JSValueIsString(ctx, arguments[0])) {
+        JSStringRef error = JSStringCreateWithUTF8CString("URL constructor requires a URL string");
+        *exception = JSValueMakeString(ctx, error);
+        JSStringRelease(error);
+        return NULL;
+    }
+
+    // Get URL string
+    JSStringRef url_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return NULL;
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(url_str);
+    char* url_input = malloc(max_size);
+    JSStringGetUTF8CString(url_str, url_input, max_size);
+    JSStringRelease(url_str);
+
+    // Create private data
+    URLData* data = malloc(sizeof(URLData));
+    memset(data, 0, sizeof(URLData));
+
+    // Parse URL components (using similar logic to js_url_parse)
+    char* current = url_input;
+
+    // Parse protocol
+    char* protocol_end = strstr(current, "://");
+    if (protocol_end) {
+        size_t protocol_len = protocol_end - current;
+        strncpy(data->protocol, current, protocol_len);
+        data->protocol[protocol_len] = '\0';
+        strcat(data->protocol, ":");
+        current = protocol_end + 3;
+    }
+
+    // Parse host (hostname + port)
+    char* path_start = strchr(current, '/');
+    char* query_start = strchr(current, '?');
+    char* hash_start = strchr(current, '#');
+
+    char* host_end = path_start;
+    if (!host_end || (query_start && query_start < host_end)) host_end = query_start;
+    if (!host_end || (hash_start && hash_start < host_end)) host_end = hash_start;
+    if (!host_end) host_end = current + strlen(current);
+
+    size_t host_len = host_end - current;
+    strncpy(data->host, current, host_len);
+    data->host[host_len] = '\0';
+
+    // Parse hostname and port from host
+    char* port_sep = strchr(data->host, ':');
+    if (port_sep) {
+        size_t hostname_len = port_sep - data->host;
+        strncpy(data->hostname, data->host, hostname_len);
+        data->hostname[hostname_len] = '\0';
+        strcpy(data->port, port_sep + 1);
+    } else {
+        strcpy(data->hostname, data->host);
+    }
+
+    current = host_end;
+
+    // Parse pathname
+    if (*current == '/') {
+        char* query_or_hash = strchr(current, '?');
+        if (!query_or_hash) query_or_hash = strchr(current, '#');
+        if (query_or_hash) {
+            size_t path_len = query_or_hash - current;
+            strncpy(data->pathname, current, path_len);
+            data->pathname[path_len] = '\0';
+            current = query_or_hash;
+        } else {
+            strcpy(data->pathname, current);
+            current += strlen(current);
+        }
+    } else {
+        strcpy(data->pathname, "/");
+    }
+
+    // Parse search (query)
+    if (*current == '?') {
+        char* hash_pos = strchr(current, '#');
+        if (hash_pos) {
+            size_t search_len = hash_pos - current;
+            strncpy(data->search, current, search_len);
+            data->search[search_len] = '\0';
+            current = hash_pos;
+        } else {
+            strcpy(data->search, current);
+            current += strlen(current);
+        }
+    }
+
+    // Parse hash
+    if (*current == '#') {
+        strcpy(data->hash, current);
+    }
+
+    // Build href (full URL)
+    snprintf(data->href, sizeof(data->href), "%s//%s%s%s%s",
+             data->protocol, data->host, data->pathname, data->search, data->hash);
+
+    // Build origin (protocol + // + host)
+    snprintf(data->origin, sizeof(data->origin), "%s//%s", data->protocol, data->host);
+
+    free(url_input);
+
+    // Create class with finalizer
+    JSClassDefinition class_def = kJSClassDefinitionEmpty;
+    class_def.finalize = url_finalize;
+    JSClassRef class = JSClassCreate(&class_def);
+    JSObjectRef instance = JSObjectMake(ctx, class, data);
+    JSClassRelease(class);
+
+    // Add properties (read-only)
+    JSStringRef href_name = JSStringCreateWithUTF8CString("href");
+    JSStringRef href_val = JSStringCreateWithUTF8CString(data->href);
+    JSObjectSetProperty(ctx, instance, href_name, JSValueMakeString(ctx, href_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(href_name);
+    JSStringRelease(href_val);
+
+    JSStringRef protocol_name = JSStringCreateWithUTF8CString("protocol");
+    JSStringRef protocol_val = JSStringCreateWithUTF8CString(data->protocol);
+    JSObjectSetProperty(ctx, instance, protocol_name, JSValueMakeString(ctx, protocol_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(protocol_name);
+    JSStringRelease(protocol_val);
+
+    JSStringRef hostname_name = JSStringCreateWithUTF8CString("hostname");
+    JSStringRef hostname_val = JSStringCreateWithUTF8CString(data->hostname);
+    JSObjectSetProperty(ctx, instance, hostname_name, JSValueMakeString(ctx, hostname_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(hostname_name);
+    JSStringRelease(hostname_val);
+
+    JSStringRef port_name = JSStringCreateWithUTF8CString("port");
+    JSStringRef port_val = JSStringCreateWithUTF8CString(data->port);
+    JSObjectSetProperty(ctx, instance, port_name, JSValueMakeString(ctx, port_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(port_name);
+    JSStringRelease(port_val);
+
+    JSStringRef pathname_name = JSStringCreateWithUTF8CString("pathname");
+    JSStringRef pathname_val = JSStringCreateWithUTF8CString(data->pathname);
+    JSObjectSetProperty(ctx, instance, pathname_name, JSValueMakeString(ctx, pathname_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(pathname_name);
+    JSStringRelease(pathname_val);
+
+    JSStringRef search_name = JSStringCreateWithUTF8CString("search");
+    JSStringRef search_val = JSStringCreateWithUTF8CString(data->search);
+    JSObjectSetProperty(ctx, instance, search_name, JSValueMakeString(ctx, search_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(search_name);
+    JSStringRelease(search_val);
+
+    JSStringRef hash_name = JSStringCreateWithUTF8CString("hash");
+    JSStringRef hash_val = JSStringCreateWithUTF8CString(data->hash);
+    JSObjectSetProperty(ctx, instance, hash_name, JSValueMakeString(ctx, hash_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(hash_name);
+    JSStringRelease(hash_val);
+
+    JSStringRef host_name = JSStringCreateWithUTF8CString("host");
+    JSStringRef host_val = JSStringCreateWithUTF8CString(data->host);
+    JSObjectSetProperty(ctx, instance, host_name, JSValueMakeString(ctx, host_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(host_name);
+    JSStringRelease(host_val);
+
+    JSStringRef origin_name = JSStringCreateWithUTF8CString("origin");
+    JSStringRef origin_val = JSStringCreateWithUTF8CString(data->origin);
+    JSObjectSetProperty(ctx, instance, origin_name, JSValueMakeString(ctx, origin_val),
+                        kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(origin_name);
+    JSStringRelease(origin_val);
+
+    // Add toString method
+    JSStringRef tostring_name = JSStringCreateWithUTF8CString("toString");
+    JSObjectRef tostring_func = JSObjectMakeFunctionWithCallback(ctx, tostring_name, js_url_tostring);
+    JSObjectSetProperty(ctx, instance, tostring_name, tostring_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(tostring_name);
+
+    // Add toJSON method
+    JSStringRef tojson_name = JSStringCreateWithUTF8CString("toJSON");
+    JSObjectRef tojson_func = JSObjectMakeFunctionWithCallback(ctx, tojson_name, js_url_tojson);
+    JSObjectSetProperty(ctx, instance, tojson_name, tojson_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(tojson_name);
+
+    return instance;
+}
+
+// URLSearchParams data structure
+typedef struct URLSearchParam {
+    char* key;
+    char* value;
+    struct URLSearchParam* next;
+} URLSearchParam;
+
+typedef struct {
+    URLSearchParam* head;
+    size_t count;
+} URLSearchParamsData;
+
+// URLSearchParams finalizer
+static void url_search_params_finalize(JSObjectRef object) {
+    URLSearchParamsData* data = JSObjectGetPrivate(object);
+    if (data) {
+        URLSearchParam* current = data->head;
+        while (current) {
+            URLSearchParam* next = current->next;
+            free(current->key);
+            free(current->value);
+            free(current);
+            current = next;
+        }
+        free(data);
+    }
+}
+
+// URLSearchParams.append(key, value)
+static JSValueRef js_url_search_params_append(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                                JSObjectRef thisObject, size_t argumentCount,
+                                                const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 2) return JSValueMakeUndefined(ctx);
+
+    URLSearchParamsData* data = JSObjectGetPrivate(thisObject);
+    if (!data) return JSValueMakeUndefined(ctx);
+
+    // Get key and value
+    JSStringRef key_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+    JSStringRef val_str = JSValueToStringCopy(ctx, arguments[1], exception);
+    if (*exception) { JSStringRelease(key_str); return JSValueMakeUndefined(ctx); }
+
+    size_t key_size = JSStringGetMaximumUTF8CStringSize(key_str);
+    char* key = malloc(key_size);
+    JSStringGetUTF8CString(key_str, key, key_size);
+    JSStringRelease(key_str);
+
+    size_t val_size = JSStringGetMaximumUTF8CStringSize(val_str);
+    char* value = malloc(val_size);
+    JSStringGetUTF8CString(val_str, value, val_size);
+    JSStringRelease(val_str);
+
+    // Create new param
+    URLSearchParam* param = malloc(sizeof(URLSearchParam));
+    param->key = key;
+    param->value = value;
+    param->next = NULL;
+
+    // Append to list
+    if (!data->head) {
+        data->head = param;
+    } else {
+        URLSearchParam* current = data->head;
+        while (current->next) current = current->next;
+        current->next = param;
+    }
+    data->count++;
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// URLSearchParams.get(key)
+static JSValueRef js_url_search_params_get(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                            JSObjectRef thisObject, size_t argumentCount,
+                                            const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) return JSValueMakeNull(ctx);
+
+    URLSearchParamsData* data = JSObjectGetPrivate(thisObject);
+    if (!data) return JSValueMakeNull(ctx);
+
+    JSStringRef key_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeNull(ctx);
+
+    size_t key_size = JSStringGetMaximumUTF8CStringSize(key_str);
+    char* key = malloc(key_size);
+    JSStringGetUTF8CString(key_str, key, key_size);
+    JSStringRelease(key_str);
+
+    // Find first matching key
+    URLSearchParam* current = data->head;
+    while (current) {
+        if (strcmp(current->key, key) == 0) {
+            JSStringRef result_str = JSStringCreateWithUTF8CString(current->value);
+            JSValueRef result = JSValueMakeString(ctx, result_str);
+            JSStringRelease(result_str);
+            free(key);
+            return result;
+        }
+        current = current->next;
+    }
+
+    free(key);
+    return JSValueMakeNull(ctx);
+}
+
+// URLSearchParams.has(key)
+static JSValueRef js_url_search_params_has(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                            JSObjectRef thisObject, size_t argumentCount,
+                                            const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) return JSValueMakeBoolean(ctx, false);
+
+    URLSearchParamsData* data = JSObjectGetPrivate(thisObject);
+    if (!data) return JSValueMakeBoolean(ctx, false);
+
+    JSStringRef key_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeBoolean(ctx, false);
+
+    size_t key_size = JSStringGetMaximumUTF8CStringSize(key_str);
+    char* key = malloc(key_size);
+    JSStringGetUTF8CString(key_str, key, key_size);
+    JSStringRelease(key_str);
+
+    // Find key
+    URLSearchParam* current = data->head;
+    while (current) {
+        if (strcmp(current->key, key) == 0) {
+            free(key);
+            return JSValueMakeBoolean(ctx, true);
+        }
+        current = current->next;
+    }
+
+    free(key);
+    return JSValueMakeBoolean(ctx, false);
+}
+
+// URLSearchParams.toString()
+static JSValueRef js_url_search_params_tostring(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                                 JSObjectRef thisObject, size_t argumentCount __attribute__((unused)),
+                                                 const JSValueRef arguments[] __attribute__((unused)),
+                                                 JSValueRef* exception __attribute__((unused))) {
+    URLSearchParamsData* data = JSObjectGetPrivate(thisObject);
+    if (!data || !data->head) {
+        return JSValueMakeString(ctx, JSStringCreateWithUTF8CString(""));
+    }
+
+    // Build query string
+    char* result = malloc(4096);
+    result[0] = '\0';
+    int first = 1;
+
+    URLSearchParam* current = data->head;
+    while (current) {
+        if (!first) strcat(result, "&");
+        strcat(result, current->key);
+        strcat(result, "=");
+        strcat(result, current->value);
+        first = 0;
+        current = current->next;
+    }
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(result);
+    JSValueRef js_result = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(result);
+
+    return js_result;
+}
+
+// URLSearchParams constructor
+static JSObjectRef js_url_search_params_constructor(JSContextRef ctx, JSObjectRef constructor __attribute__((unused)),
+                                                     size_t argumentCount,
+                                                     const JSValueRef arguments[], JSValueRef* exception) {
+    // Create private data
+    URLSearchParamsData* data = malloc(sizeof(URLSearchParamsData));
+    data->head = NULL;
+    data->count = 0;
+
+    // Parse input if provided
+    if (argumentCount > 0 && JSValueIsString(ctx, arguments[0])) {
+        JSStringRef input_str = JSValueToStringCopy(ctx, arguments[0], exception);
+        if (!*exception) {
+            size_t input_size = JSStringGetMaximumUTF8CStringSize(input_str);
+            char* input = malloc(input_size);
+            JSStringGetUTF8CString(input_str, input, input_size);
+            JSStringRelease(input_str);
+
+            // Remove leading '?' if present
+            char* query = input;
+            if (query[0] == '?') query++;
+
+            // Parse key=value pairs
+            char* pair = strtok(query, "&");
+            while (pair) {
+                char* eq = strchr(pair, '=');
+                if (eq) {
+                    *eq = '\0';
+                    char* key = pair;
+                    char* value = eq + 1;
+
+                    URLSearchParam* param = malloc(sizeof(URLSearchParam));
+                    param->key = strdup(key);
+                    param->value = strdup(value);
+                    param->next = NULL;
+
+                    if (!data->head) {
+                        data->head = param;
+                    } else {
+                        URLSearchParam* current = data->head;
+                        while (current->next) current = current->next;
+                        current->next = param;
+                    }
+                    data->count++;
+                }
+                pair = strtok(NULL, "&");
+            }
+
+            free(input);
+        }
+    }
+
+    // Create class with finalizer
+    JSClassDefinition class_def = kJSClassDefinitionEmpty;
+    class_def.finalize = url_search_params_finalize;
+    JSClassRef class = JSClassCreate(&class_def);
+    JSObjectRef instance = JSObjectMake(ctx, class, data);
+    JSClassRelease(class);
+
+    // Add methods
+    JSStringRef append_name = JSStringCreateWithUTF8CString("append");
+    JSObjectRef append_func = JSObjectMakeFunctionWithCallback(ctx, append_name, js_url_search_params_append);
+    JSObjectSetProperty(ctx, instance, append_name, append_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(append_name);
+
+    JSStringRef get_name = JSStringCreateWithUTF8CString("get");
+    JSObjectRef get_func = JSObjectMakeFunctionWithCallback(ctx, get_name, js_url_search_params_get);
+    JSObjectSetProperty(ctx, instance, get_name, get_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(get_name);
+
+    JSStringRef has_name = JSStringCreateWithUTF8CString("has");
+    JSObjectRef has_func = JSObjectMakeFunctionWithCallback(ctx, has_name, js_url_search_params_has);
+    JSObjectSetProperty(ctx, instance, has_name, has_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(has_name);
+
+    JSStringRef tostring_name = JSStringCreateWithUTF8CString("toString");
+    JSObjectRef tostring_func = JSObjectMakeFunctionWithCallback(ctx, tostring_name, js_url_search_params_tostring);
+    JSObjectSetProperty(ctx, instance, tostring_name, tostring_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(tostring_name);
+
+    return instance;
+}
+
+// AbortSignal data structure
+typedef struct {
+    int aborted;
+    JSObjectRef reason;
+    JSObjectRef onabort_callback;
+    JSContextRef ctx;
+} AbortSignalData;
+
+// AbortSignal finalizer
+static void abort_signal_finalize(JSObjectRef object) {
+    AbortSignalData* data = JSObjectGetPrivate(object);
+    if (data) {
+        if (data->reason) JSValueUnprotect(data->ctx, data->reason);
+        if (data->onabort_callback) JSValueUnprotect(data->ctx, data->onabort_callback);
+        free(data);
+    }
+}
+
+// AbortController data structure
+typedef struct {
+    JSObjectRef signal;
+    JSContextRef ctx;
+} AbortControllerData;
+
+// AbortController finalizer
+static void abort_controller_finalize(JSObjectRef object) {
+    AbortControllerData* data = JSObjectGetPrivate(object);
+    if (data) {
+        if (data->signal) JSValueUnprotect(data->ctx, data->signal);
+        free(data);
+    }
+}
+
+// AbortController.abort(reason) method
+static JSValueRef js_abort_controller_abort(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                             JSObjectRef thisObject, size_t argumentCount,
+                                             const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    AbortControllerData* controller_data = JSObjectGetPrivate(thisObject);
+    if (!controller_data || !controller_data->signal) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get signal's private data
+    AbortSignalData* signal_data = JSObjectGetPrivate(controller_data->signal);
+    if (!signal_data) return JSValueMakeUndefined(ctx);
+
+    // Set aborted to true
+    signal_data->aborted = 1;
+
+    // Set reason if provided
+    if (argumentCount > 0) {
+        if (signal_data->reason) {
+            JSValueUnprotect(ctx, signal_data->reason);
+        }
+        signal_data->reason = JSValueToObject(ctx, arguments[0], NULL);
+        if (signal_data->reason) {
+            JSValueProtect(ctx, signal_data->reason);
+        }
+    }
+
+    // Update aborted property on signal object
+    JSStringRef aborted_name = JSStringCreateWithUTF8CString("aborted");
+    JSObjectSetProperty(ctx, controller_data->signal, aborted_name, JSValueMakeBoolean(ctx, true),
+                        kJSPropertyAttributeNone, NULL);
+    JSStringRelease(aborted_name);
+
+    // Call onabort callback if set (read from JS object property)
+    JSStringRef onabort_name = JSStringCreateWithUTF8CString("onabort");
+    JSValueRef onabort_val = JSObjectGetProperty(ctx, controller_data->signal, onabort_name, NULL);
+    JSStringRelease(onabort_name);
+
+    if (onabort_val && JSValueIsObject(ctx, onabort_val)) {
+        JSObjectRef onabort_func = JSValueToObject(ctx, onabort_val, NULL);
+        if (onabort_func && JSObjectIsFunction(ctx, onabort_func)) {
+            JSObjectCallAsFunction(ctx, onabort_func, controller_data->signal, 0, NULL, NULL);
+        }
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// AbortSignal constructor (should not be called directly, but needed for internal use)
+static JSObjectRef create_abort_signal(JSContextRef ctx) {
+    // Create private data
+    AbortSignalData* data = malloc(sizeof(AbortSignalData));
+    data->aborted = 0;
+    data->reason = NULL;
+    data->onabort_callback = NULL;
+    data->ctx = ctx;
+
+    // Create class with finalizer
+    JSClassDefinition class_def = kJSClassDefinitionEmpty;
+    class_def.finalize = abort_signal_finalize;
+    JSClassRef class = JSClassCreate(&class_def);
+    JSObjectRef instance = JSObjectMake(ctx, class, data);
+    JSClassRelease(class);
+
+    // Add aborted property
+    JSStringRef aborted_name = JSStringCreateWithUTF8CString("aborted");
+    JSObjectSetProperty(ctx, instance, aborted_name, JSValueMakeBoolean(ctx, false),
+                        kJSPropertyAttributeNone, NULL);
+    JSStringRelease(aborted_name);
+
+    // Add reason property
+    JSStringRef reason_name = JSStringCreateWithUTF8CString("reason");
+    JSObjectSetProperty(ctx, instance, reason_name, JSValueMakeUndefined(ctx),
+                        kJSPropertyAttributeNone, NULL);
+    JSStringRelease(reason_name);
+
+    // Add onabort property (initially null)
+    JSStringRef onabort_name = JSStringCreateWithUTF8CString("onabort");
+    JSObjectSetProperty(ctx, instance, onabort_name, JSValueMakeNull(ctx),
+                        kJSPropertyAttributeNone, NULL);
+    JSStringRelease(onabort_name);
+
+    return instance;
+}
+
+// AbortController constructor
+static JSObjectRef js_abort_controller_constructor(JSContextRef ctx, JSObjectRef constructor __attribute__((unused)),
+                                                    size_t argumentCount __attribute__((unused)),
+                                                    const JSValueRef arguments[] __attribute__((unused)),
+                                                    JSValueRef* exception __attribute__((unused))) {
+    // Create signal
+    JSObjectRef signal = create_abort_signal(ctx);
+
+    // Create private data
+    AbortControllerData* data = malloc(sizeof(AbortControllerData));
+    data->signal = signal;
+    data->ctx = ctx;
+    JSValueProtect(ctx, signal);
+
+    // Create class with finalizer
+    JSClassDefinition class_def = kJSClassDefinitionEmpty;
+    class_def.finalize = abort_controller_finalize;
+    JSClassRef class = JSClassCreate(&class_def);
+    JSObjectRef instance = JSObjectMake(ctx, class, data);
+    JSClassRelease(class);
+
+    // Add signal property (read-only)
+    JSStringRef signal_name = JSStringCreateWithUTF8CString("signal");
+    JSObjectSetProperty(ctx, instance, signal_name, signal, kJSPropertyAttributeReadOnly, NULL);
+    JSStringRelease(signal_name);
+
+    // Add abort method
+    JSStringRef abort_name = JSStringCreateWithUTF8CString("abort");
+    JSObjectRef abort_func = JSObjectMakeFunctionWithCallback(ctx, abort_name, js_abort_controller_abort);
+    JSObjectSetProperty(ctx, instance, abort_name, abort_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(abort_name);
+
+    return instance;
+}
+
 // Console.log implementation (stdout)
 static JSValueRef js_console_log(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
@@ -6910,6 +7886,73 @@ int main(int argc, char* argv[]) {
     JSStringRef ws_name = JSStringCreateWithUTF8CString("WebSocket");
     JSObjectSetProperty(ctx, global, ws_name, ws_constructor, kJSPropertyAttributeNone, NULL);
     JSStringRelease(ws_name);
+
+    // Setup TextEncoder constructor
+    JSClassDefinition text_encoder_def = kJSClassDefinitionEmpty;
+    text_encoder_def.callAsConstructor = js_text_encoder_constructor;
+    JSClassRef text_encoder_class = JSClassCreate(&text_encoder_def);
+    JSObjectRef text_encoder_constructor = JSObjectMake(ctx, text_encoder_class, NULL);
+    JSClassRelease(text_encoder_class);
+
+    JSStringRef text_encoder_name = JSStringCreateWithUTF8CString("TextEncoder");
+    JSObjectSetProperty(ctx, global, text_encoder_name, text_encoder_constructor, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(text_encoder_name);
+
+    // Setup TextDecoder constructor
+    JSClassDefinition text_decoder_def = kJSClassDefinitionEmpty;
+    text_decoder_def.callAsConstructor = js_text_decoder_constructor;
+    JSClassRef text_decoder_class = JSClassCreate(&text_decoder_def);
+    JSObjectRef text_decoder_constructor = JSObjectMake(ctx, text_decoder_class, NULL);
+    JSClassRelease(text_decoder_class);
+
+    JSStringRef text_decoder_name = JSStringCreateWithUTF8CString("TextDecoder");
+    JSObjectSetProperty(ctx, global, text_decoder_name, text_decoder_constructor, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(text_decoder_name);
+
+    // Setup atob function
+    JSStringRef atob_name = JSStringCreateWithUTF8CString("atob");
+    JSObjectRef atob_func = JSObjectMakeFunctionWithCallback(ctx, atob_name, js_atob);
+    JSObjectSetProperty(ctx, global, atob_name, atob_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(atob_name);
+
+    // Setup btoa function
+    JSStringRef btoa_name = JSStringCreateWithUTF8CString("btoa");
+    JSObjectRef btoa_func = JSObjectMakeFunctionWithCallback(ctx, btoa_name, js_btoa);
+    JSObjectSetProperty(ctx, global, btoa_name, btoa_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(btoa_name);
+
+    // Setup URL constructor
+    JSClassDefinition url_def = kJSClassDefinitionEmpty;
+    url_def.callAsConstructor = js_url_constructor;
+    JSClassRef url_class = JSClassCreate(&url_def);
+    JSObjectRef url_constructor = JSObjectMake(ctx, url_class, NULL);
+    JSClassRelease(url_class);
+
+    JSStringRef url_name = JSStringCreateWithUTF8CString("URL");
+    JSObjectSetProperty(ctx, global, url_name, url_constructor, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(url_name);
+
+    // Setup URLSearchParams constructor
+    JSClassDefinition url_search_params_def = kJSClassDefinitionEmpty;
+    url_search_params_def.callAsConstructor = js_url_search_params_constructor;
+    JSClassRef url_search_params_class = JSClassCreate(&url_search_params_def);
+    JSObjectRef url_search_params_constructor = JSObjectMake(ctx, url_search_params_class, NULL);
+    JSClassRelease(url_search_params_class);
+
+    JSStringRef url_search_params_name = JSStringCreateWithUTF8CString("URLSearchParams");
+    JSObjectSetProperty(ctx, global, url_search_params_name, url_search_params_constructor, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(url_search_params_name);
+
+    // Setup AbortController constructor
+    JSClassDefinition abort_controller_def = kJSClassDefinitionEmpty;
+    abort_controller_def.callAsConstructor = js_abort_controller_constructor;
+    JSClassRef abort_controller_class = JSClassCreate(&abort_controller_def);
+    JSObjectRef abort_controller_constructor = JSObjectMake(ctx, abort_controller_class, NULL);
+    JSClassRelease(abort_controller_class);
+
+    JSStringRef abort_controller_name = JSStringCreateWithUTF8CString("AbortController");
+    JSObjectSetProperty(ctx, global, abort_controller_name, abort_controller_constructor, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(abort_controller_name);
 
     // Setup __krandog_import for module loading
     JSStringRef import_name = JSStringCreateWithUTF8CString("__krandog_import");
