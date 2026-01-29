@@ -48,6 +48,7 @@ macos only.
 - child_process (spawn, exec)
 - event loop (kqueue)
 - promises and microtasks
+- promise utilities (all, race, allSettled, any, finally)
 - fetch (libcurl)
 - http server
 - http/https modules
@@ -64,6 +65,7 @@ macos only.
 - process (argv, env, exit)
 - path module
 - console (log, error, warn)
+- web apis (URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, atob, btoa)
 - __dirname, __filename
 
 ## npm packages
@@ -352,19 +354,44 @@ writeStream.end();
 ## globals
 
 ```javascript
+// network
 fetch(url)                    // http client
 serve(port, handler)          // http server
 WebSocket(url)                // websocket client
+
+// promises
+Promise.all(promises)         // wait for all
+Promise.race(promises)        // first to settle
+Promise.allSettled(promises)  // wait for all (ignore failures)
+Promise.any(promises)         // first to fulfill
+promise.finally(handler)      // cleanup
+
+// web apis
+new URL(url)                  // url parser
+new URLSearchParams(query)    // query string parser
+new TextEncoder()             // string to utf-8
+new TextDecoder()             // utf-8 to string
+new AbortController()         // cancelable operations
+atob(base64)                  // decode base64
+btoa(string)                  // encode base64
+
+// testing
 test(name, fn)                // register test
 assert(condition, message)    // test assertion
 assertEqual(a, b)             // equality assertion
 run()                         // run tests
+
+// buffers & console
 Buffer.from(string)           // create buffer
 Buffer.alloc(size)            // allocate buffer
 console.log/error/warn        // stdout/stderr
+
+// process & timing
 process.argv/env/exit         // process stuff
 setTimeout/setInterval        // timers
 queueMicrotask                // microtasks
+
+// paths
 __dirname/__filename          // module paths
 ```
 
@@ -374,7 +401,7 @@ __dirname/__filename          // module paths
 make test
 ```
 
-52 tests pass.
+87 tests pass.
 
 ## why
 
