@@ -1,0 +1,11 @@
+# Build artifacts
+krandog
+*.o
+*.dSYM/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
