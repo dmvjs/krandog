@@ -434,6 +434,313 @@ static JSValueRef js_fs_unlink_sync(JSContextRef ctx, JSObjectRef function __att
     return JSValueMakeUndefined(ctx);
 }
 
+// path.join implementation
+static JSValueRef js_path_join(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount == 0) {
+        return JSValueMakeString(ctx, JSStringCreateWithUTF8CString("."));
+    }
+
+    char result[PATH_MAX * 2] = {0};
+    char* out = result;
+
+    for (size_t i = 0; i < argumentCount; i++) {
+        JSStringRef seg_str = JSValueToStringCopy(ctx, arguments[i], exception);
+        if (*exception) return JSValueMakeUndefined(ctx);
+
+        size_t max_size = JSStringGetMaximumUTF8CStringSize(seg_str);
+        char* segment = malloc(max_size);
+        JSStringGetUTF8CString(seg_str, segment, max_size);
+        JSStringRelease(seg_str);
+
+        // Skip empty segments
+        if (strlen(segment) == 0) {
+            free(segment);
+            continue;
+        }
+
+        // Handle absolute paths
+        if (segment[0] == '/' && out == result) {
+            out += sprintf(out, "/");
+        } else if (out > result && *(out - 1) != '/') {
+            out += sprintf(out, "/");
+        }
+
+        // Copy segment, skipping leading slash
+        const char* src = (segment[0] == '/') ? segment + 1 : segment;
+        while (*src) {
+            *out++ = *src++;
+        }
+
+        free(segment);
+    }
+    *out = '\0';
+
+    // Normalize (resolve ..)
+    char normalized[PATH_MAX * 2];
+    char* segments[256];
+    int seg_count = 0;
+    int is_absolute = (result[0] == '/');
+
+    char* copy = strdup(result);
+    char* token = strtok(copy, "/");
+    while (token) {
+        if (strcmp(token, "..") == 0) {
+            if (seg_count > 0 && strcmp(segments[seg_count - 1], "..") != 0) {
+                seg_count--;
+            } else if (!is_absolute) {
+                segments[seg_count++] = "..";
+            }
+        } else if (strcmp(token, ".") != 0) {
+            segments[seg_count++] = token;
+        }
+        token = strtok(NULL, "/");
+    }
+
+    char* norm = normalized;
+    if (is_absolute) *norm++ = '/';
+    for (int i = 0; i < seg_count; i++) {
+        if (i > 0) *norm++ = '/';
+        strcpy(norm, segments[i]);
+        norm += strlen(segments[i]);
+    }
+    *norm = '\0';
+    free(copy);
+
+    if (normalized[0] == '\0') {
+        strcpy(normalized, ".");
+    }
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(normalized);
+    JSValueRef result_val = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+
+    return result_val;
+}
+
+// path.basename implementation
+static JSValueRef js_path_basename(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                    JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                    const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeString(ctx, JSStringCreateWithUTF8CString(""));
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    char* base = basename(path);
+    char* result = strdup(base);
+    free(path);
+
+    // Handle optional extension to strip
+    if (argumentCount >= 2) {
+        JSStringRef ext_str = JSValueToStringCopy(ctx, arguments[1], exception);
+        if (!*exception) {
+            size_t ext_size = JSStringGetMaximumUTF8CStringSize(ext_str);
+            char* ext = malloc(ext_size);
+            JSStringGetUTF8CString(ext_str, ext, ext_size);
+            JSStringRelease(ext_str);
+
+            size_t result_len = strlen(result);
+            size_t ext_len = strlen(ext);
+            if (result_len >= ext_len && strcmp(result + result_len - ext_len, ext) == 0) {
+                result[result_len - ext_len] = '\0';
+            }
+            free(ext);
+        }
+    }
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(result);
+    JSValueRef result_val = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(result);
+
+    return result_val;
+}
+
+// path.dirname implementation
+static JSValueRef js_path_dirname(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                   const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeString(ctx, JSStringCreateWithUTF8CString("."));
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    char* dir = dirname(path);
+    char* result = strdup(dir);
+    free(path);
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(result);
+    JSValueRef result_val = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(result);
+
+    return result_val;
+}
+
+// path.extname implementation
+static JSValueRef js_path_extname(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                   const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeString(ctx, JSStringCreateWithUTF8CString(""));
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    char* dot = strrchr(path, '.');
+    char* slash = strrchr(path, '/');
+
+    char* result = "";
+    if (dot && (!slash || dot > slash)) {
+        result = dot;
+    }
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(result);
+    JSValueRef result_val = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(path);
+
+    return result_val;
+}
+
+// path.resolve implementation
+static JSValueRef js_path_resolve(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                   const JSValueRef arguments[], JSValueRef* exception) {
+    char cwd[PATH_MAX];
+    getcwd(cwd, sizeof(cwd));
+
+    char result[PATH_MAX * 2];
+    strcpy(result, cwd);
+
+    for (size_t i = 0; i < argumentCount; i++) {
+        JSStringRef seg_str = JSValueToStringCopy(ctx, arguments[i], exception);
+        if (*exception) return JSValueMakeUndefined(ctx);
+
+        size_t max_size = JSStringGetMaximumUTF8CStringSize(seg_str);
+        char* segment = malloc(max_size);
+        JSStringGetUTF8CString(seg_str, segment, max_size);
+        JSStringRelease(seg_str);
+
+        if (segment[0] == '/') {
+            strcpy(result, segment);
+        } else {
+            strcat(result, "/");
+            strcat(result, segment);
+        }
+
+        free(segment);
+    }
+
+    char* real = realpath(result, NULL);
+    if (!real) {
+        // If realpath fails, normalize manually
+        real = strdup(result);
+    }
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(real);
+    JSValueRef result_val = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(real);
+
+    return result_val;
+}
+
+// path.isAbsolute implementation
+static JSValueRef js_path_is_absolute(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                       JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                       const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeBoolean(ctx, false);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeBoolean(ctx, false);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    int is_absolute = (path[0] == '/');
+    free(path);
+
+    return JSValueMakeBoolean(ctx, is_absolute);
+}
+
+// Create path module object
+static JSObjectRef create_path_module(JSContextRef ctx) {
+    JSObjectRef path = JSObjectMake(ctx, NULL, NULL);
+
+    JSStringRef join_name = JSStringCreateWithUTF8CString("join");
+    JSObjectRef join_func = JSObjectMakeFunctionWithCallback(ctx, join_name, js_path_join);
+    JSObjectSetProperty(ctx, path, join_name, join_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(join_name);
+
+    JSStringRef basename_name = JSStringCreateWithUTF8CString("basename");
+    JSObjectRef basename_func = JSObjectMakeFunctionWithCallback(ctx, basename_name, js_path_basename);
+    JSObjectSetProperty(ctx, path, basename_name, basename_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(basename_name);
+
+    JSStringRef dirname_name = JSStringCreateWithUTF8CString("dirname");
+    JSObjectRef dirname_func = JSObjectMakeFunctionWithCallback(ctx, dirname_name, js_path_dirname);
+    JSObjectSetProperty(ctx, path, dirname_name, dirname_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(dirname_name);
+
+    JSStringRef extname_name = JSStringCreateWithUTF8CString("extname");
+    JSObjectRef extname_func = JSObjectMakeFunctionWithCallback(ctx, extname_name, js_path_extname);
+    JSObjectSetProperty(ctx, path, extname_name, extname_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(extname_name);
+
+    JSStringRef resolve_name = JSStringCreateWithUTF8CString("resolve");
+    JSObjectRef resolve_func = JSObjectMakeFunctionWithCallback(ctx, resolve_name, js_path_resolve);
+    JSObjectSetProperty(ctx, path, resolve_name, resolve_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(resolve_name);
+
+    JSStringRef isAbsolute_name = JSStringCreateWithUTF8CString("isAbsolute");
+    JSObjectRef isAbsolute_func = JSObjectMakeFunctionWithCallback(ctx, isAbsolute_name, js_path_is_absolute);
+    JSObjectSetProperty(ctx, path, isAbsolute_name, isAbsolute_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(isAbsolute_name);
+
+    // path.sep
+    JSStringRef sep_name = JSStringCreateWithUTF8CString("sep");
+    JSStringRef sep_value = JSStringCreateWithUTF8CString("/");
+    JSObjectSetProperty(ctx, path, sep_name, JSValueMakeString(ctx, sep_value), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(sep_name);
+    JSStringRelease(sep_value);
+
+    // path.delimiter
+    JSStringRef delimiter_name = JSStringCreateWithUTF8CString("delimiter");
+    JSStringRef delimiter_value = JSStringCreateWithUTF8CString(":");
+    JSObjectSetProperty(ctx, path, delimiter_name, JSValueMakeString(ctx, delimiter_value), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(delimiter_name);
+    JSStringRelease(delimiter_value);
+
+    return path;
+}
+
 // Create fs module object
 static JSObjectRef create_fs_module(JSContextRef ctx) {
     JSObjectRef fs = JSObjectMake(ctx, NULL, NULL);
@@ -806,7 +1113,7 @@ static JSValueRef js_krandog_import(JSContextRef ctx, JSObjectRef function __att
     JSStringRelease(path_str);
 
     // Check for built-in modules
-    if (strcmp(module_path, "fs") == 0) {
+    if (strcmp(module_path, "fs") == 0 || strcmp(module_path, "path") == 0) {
         JSValueRef result = load_es_module(ctx, module_path, exception);
         free(module_path);
         return result;
@@ -1007,7 +1314,7 @@ static char* transpile_es_module(const char* source) {
 
 static JSValueRef load_es_module(JSContextRef ctx, const char* path, JSValueRef* exception) {
     // Check for built-in modules
-    if (strcmp(path, "fs") == 0) {
+    if (strcmp(path, "fs") == 0 || strcmp(path, "path") == 0) {
         JSStringRef cache_key = JSStringCreateWithUTF8CString(path);
         JSValueRef cached = JSObjectGetProperty(ctx, module_cache, cache_key, NULL);
 
@@ -1016,12 +1323,17 @@ static JSValueRef load_es_module(JSContextRef ctx, const char* path, JSValueRef*
             return cached;
         }
 
-        JSObjectRef fs_module = create_fs_module(ctx);
+        JSObjectRef builtin_module;
+        if (strcmp(path, "fs") == 0) {
+            builtin_module = create_fs_module(ctx);
+        } else {
+            builtin_module = create_path_module(ctx);
+        }
 
         // Wrap in module exports object with default property
         JSObjectRef exports = JSObjectMake(ctx, NULL, NULL);
         JSStringRef default_name = JSStringCreateWithUTF8CString("default");
-        JSObjectSetProperty(ctx, exports, default_name, fs_module, kJSPropertyAttributeNone, NULL);
+        JSObjectSetProperty(ctx, exports, default_name, builtin_module, kJSPropertyAttributeNone, NULL);
         JSStringRelease(default_name);
 
         JSObjectSetProperty(ctx, module_cache, cache_key, exports, kJSPropertyAttributeNone, NULL);
