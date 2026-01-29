@@ -1,0 +1,9 @@
+
+Running 3 tests...
+
+  [0;32m✓[0m this passes
+  [0;31m✗[0m this fails
+    expected failure
+  [0;32m✓[0m this also passes
+
+[0;31m1 failed[0m, 2 passed, 3 total

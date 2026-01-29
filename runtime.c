@@ -2151,6 +2151,11 @@ static JSValueRef js_net_create_connection(JSContextRef ctx, JSObjectRef functio
 
     JSObjectRef sock_obj = create_tcp_socket_object(ctx, sock);
 
+    // Initialize kqueue if not already done
+    if (kq == -1) {
+        kq = kqueue();
+    }
+
     // Add to kqueue
     struct kevent ev;
     EV_SET(&ev, sock_fd, EVFILT_READ, EV_ADD, 0, 0, sock_obj);
@@ -2258,6 +2263,11 @@ static JSValueRef js_tcp_server_listen(JSContextRef ctx, JSObjectRef function __
     JSObjectSetProperty(ctx, thisObject, server_ptr_name, JSValueMakeNumber(ctx, (double)(uintptr_t)server),
                         kJSPropertyAttributeNone, NULL);
     JSStringRelease(server_ptr_name);
+
+    // Initialize kqueue if not already done
+    if (kq == -1) {
+        kq = kqueue();
+    }
 
     // Add to kqueue
     struct kevent ev;
@@ -4273,6 +4283,18 @@ void run_event_loop() {
                             if (tcp_sock->on_close) {
                                 JSObjectCallAsFunction(global_ctx, tcp_sock->on_close, obj, 0, NULL, NULL);
                             }
+
+                            // Unregister from kqueue
+                            struct kevent cev;
+                            EV_SET(&cev, tcp_sock->socket_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+                            kevent(kq, &cev, 1, NULL, 0, NULL);
+
+                            // Close socket
+                            close(tcp_sock->socket_fd);
+
+                            // Mark as closed (socket_fd = -1 indicates closed)
+                            tcp_sock->socket_fd = -1;
+
                             continue;
                         }
 
@@ -4471,6 +4493,9 @@ void run_event_loop() {
                     int client_fd = accept(srv->socket_fd, (struct sockaddr*)&client_addr, &client_len);
 
                     if (client_fd >= 0) {
+                        // Set socket to blocking for request read
+                        fcntl(client_fd, F_SETFL, 0);
+
                         // Read request
                         char buffer[8192] = {0};
                         ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
