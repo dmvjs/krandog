@@ -5095,6 +5095,14 @@ void run_event_loop() {
                         if (bytes_read > 0) {
                             buffer[bytes_read] = '\0';
 
+                            // Find body before tokenizing (strtok modifies buffer)
+                            char body_buffer[4096] = {0};
+                            char* body_start = strstr(buffer, "\r\n\r\n");
+                            if (body_start) {
+                                body_start += 4;  // Skip \r\n\r\n
+                                strncpy(body_buffer, body_start, sizeof(body_buffer) - 1);
+                            }
+
                             // Parse request
                             char method[16] = {0};
                             char path[1024] = {0};
@@ -5139,6 +5147,88 @@ void run_event_loop() {
                             JSStringRef headers_name = JSStringCreateWithUTF8CString("headers");
                             JSObjectSetProperty(global_ctx, req, headers_name, headers, kJSPropertyAttributeNone, NULL);
                             JSStringRelease(headers_name);
+
+                            // Parse query string from path
+                            char pathname[1024] = {0};
+                            char querystring[1024] = {0};
+                            char* query_start = strchr(path, '?');
+                            if (query_start) {
+                                size_t path_len = query_start - path;
+                                strncpy(pathname, path, path_len);
+                                pathname[path_len] = '\0';
+                                strcpy(querystring, query_start + 1);
+                            } else {
+                                strcpy(pathname, path);
+                            }
+
+                            // Add pathname
+                            JSStringRef pathname_name = JSStringCreateWithUTF8CString("pathname");
+                            JSStringRef pathname_value = JSStringCreateWithUTF8CString(pathname);
+                            JSObjectSetProperty(global_ctx, req, pathname_name, JSValueMakeString(global_ctx, pathname_value), kJSPropertyAttributeNone, NULL);
+                            JSStringRelease(pathname_name);
+                            JSStringRelease(pathname_value);
+
+                            // Parse query string into object
+                            JSObjectRef query = JSObjectMake(global_ctx, NULL, NULL);
+                            if (strlen(querystring) > 0) {
+                                char* query_copy = strdup(querystring);
+                                char* pair = strtok(query_copy, "&");
+                                while (pair) {
+                                    char* eq = strchr(pair, '=');
+                                    if (eq) {
+                                        *eq = '\0';
+                                        char* key = pair;
+                                        char* value = eq + 1;
+
+                                        JSStringRef key_str = JSStringCreateWithUTF8CString(key);
+                                        JSStringRef value_str = JSStringCreateWithUTF8CString(value);
+                                        JSObjectSetProperty(global_ctx, query, key_str, JSValueMakeString(global_ctx, value_str), kJSPropertyAttributeNone, NULL);
+                                        JSStringRelease(key_str);
+                                        JSStringRelease(value_str);
+                                    }
+                                    pair = strtok(NULL, "&");
+                                }
+                                free(query_copy);
+                            }
+
+                            JSStringRef query_name = JSStringCreateWithUTF8CString("query");
+                            JSObjectSetProperty(global_ctx, req, query_name, query, kJSPropertyAttributeNone, NULL);
+                            JSStringRelease(query_name);
+
+                            // Parse request body (use saved body_buffer)
+                            if (strlen(body_buffer) > 0) {
+                                // Add raw body
+                                JSStringRef body_name = JSStringCreateWithUTF8CString("body");
+                                JSStringRef body_value = JSStringCreateWithUTF8CString(body_buffer);
+                                JSObjectSetProperty(global_ctx, req, body_name, JSValueMakeString(global_ctx, body_value), kJSPropertyAttributeNone, NULL);
+                                JSStringRelease(body_name);
+                                JSStringRelease(body_value);
+
+                                // Try to parse JSON body if Content-Type is application/json
+                                JSStringRef content_type_key = JSStringCreateWithUTF8CString("Content-Type");
+                                JSValueRef content_type_val = JSObjectGetProperty(global_ctx, headers, content_type_key, NULL);
+                                JSStringRelease(content_type_key);
+
+                                if (!JSValueIsUndefined(global_ctx, content_type_val)) {
+                                    JSStringRef ct_str = JSValueToStringCopy(global_ctx, content_type_val, NULL);
+                                    char ct_buf[128] = {0};
+                                    JSStringGetUTF8CString(ct_str, ct_buf, sizeof(ct_buf));
+                                    JSStringRelease(ct_str);
+
+                                    if (strstr(ct_buf, "application/json")) {
+                                        // Parse JSON body
+                                        JSStringRef json_str = JSStringCreateWithUTF8CString(body_buffer);
+                                        JSValueRef json_val = JSValueMakeFromJSONString(global_ctx, json_str);
+                                        JSStringRelease(json_str);
+
+                                        if (json_val && !JSValueIsUndefined(global_ctx, json_val)) {
+                                            JSStringRef json_name = JSStringCreateWithUTF8CString("json");
+                                            JSObjectSetProperty(global_ctx, req, json_name, json_val, kJSPropertyAttributeNone, NULL);
+                                            JSStringRelease(json_name);
+                                        }
+                                    }
+                                }
+                            }
 
                             // Check for WebSocket upgrade
                             JSStringRef upgrade_key = JSStringCreateWithUTF8CString("Upgrade");
@@ -5265,12 +5355,56 @@ void run_event_loop() {
                                     JSStringRelease(body_str);
                                 }
 
-                                snprintf(response, sizeof(response),
+                                // Get Content-Type (default text/plain)
+                                char content_type[256] = "text/plain";
+                                JSStringRef type_name = JSStringCreateWithUTF8CString("type");
+                                JSValueRef type_val = JSObjectGetProperty(global_ctx, res_obj, type_name, NULL);
+                                JSStringRelease(type_name);
+                                if (!JSValueIsUndefined(global_ctx, type_val)) {
+                                    JSStringRef type_str = JSValueToStringCopy(global_ctx, type_val, NULL);
+                                    JSStringGetUTF8CString(type_str, content_type, sizeof(content_type));
+                                    JSStringRelease(type_str);
+                                }
+
+                                // Build response with headers
+                                char* resp_ptr = response;
+                                resp_ptr += snprintf(resp_ptr, sizeof(response) - (resp_ptr - response),
                                     "HTTP/1.1 %d OK\r\n"
-                                    "Content-Type: text/plain\r\n"
+                                    "Content-Type: %s\r\n", status, content_type);
+
+                                // Add custom headers if provided
+                                JSStringRef headers_name = JSStringCreateWithUTF8CString("headers");
+                                JSValueRef headers_val = JSObjectGetProperty(global_ctx, res_obj, headers_name, NULL);
+                                JSStringRelease(headers_name);
+
+                                if (!JSValueIsUndefined(global_ctx, headers_val) && JSValueIsObject(global_ctx, headers_val)) {
+                                    JSObjectRef headers_obj = JSValueToObject(global_ctx, headers_val, NULL);
+                                    JSPropertyNameArrayRef prop_names = JSObjectCopyPropertyNames(global_ctx, headers_obj);
+                                    size_t prop_count = JSPropertyNameArrayGetCount(prop_names);
+
+                                    for (size_t i = 0; i < prop_count; i++) {
+                                        JSStringRef prop_name = JSPropertyNameArrayGetNameAtIndex(prop_names, i);
+                                        JSValueRef prop_val = JSObjectGetProperty(global_ctx, headers_obj, prop_name, NULL);
+
+                                        char header_name[256];
+                                        char header_value[1024];
+                                        JSStringGetUTF8CString(prop_name, header_name, sizeof(header_name));
+
+                                        JSStringRef val_str = JSValueToStringCopy(global_ctx, prop_val, NULL);
+                                        JSStringGetUTF8CString(val_str, header_value, sizeof(header_value));
+                                        JSStringRelease(val_str);
+
+                                        resp_ptr += snprintf(resp_ptr, sizeof(response) - (resp_ptr - response),
+                                            "%s: %s\r\n", header_name, header_value);
+                                    }
+                                    JSPropertyNameArrayRelease(prop_names);
+                                }
+
+                                // Finish headers and add body
+                                resp_ptr += snprintf(resp_ptr, sizeof(response) - (resp_ptr - response),
                                     "Content-Length: %zu\r\n"
                                     "Connection: close\r\n\r\n"
-                                    "%s", status, strlen(body), body);
+                                    "%s", strlen(body), body);
                             }
 
                             // Send response
