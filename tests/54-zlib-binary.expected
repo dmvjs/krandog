@@ -1,0 +1,9 @@
+original length: 13
+original first: 72
+original last: 33
+compressed length: 21
+compressed type: Uint8Array
+decompressed length: 13
+decompressed first: 72
+decompressed last: 33
+match: true

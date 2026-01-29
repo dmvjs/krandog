@@ -731,6 +731,9 @@ static JSValueRef js_buffer_from(JSContextRef ctx, JSObjectRef function __attrib
         return JSValueMakeUndefined(ctx);
     }
 
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSStringRef code = JSStringCreateWithUTF8CString("new Uint8Array(__temp_buffer_data)");
+
     // For strings, convert to UTF-8 bytes
     if (JSValueIsString(ctx, arguments[0])) {
         JSStringRef str = JSValueToStringCopy(ctx, arguments[0], exception);
@@ -740,10 +743,6 @@ static JSValueRef js_buffer_from(JSContextRef ctx, JSObjectRef function __attrib
         char* buffer = malloc(max_size);
         size_t actual_size = JSStringGetUTF8CString(str, buffer, max_size);
         JSStringRelease(str);
-
-        // Create Uint8Array
-        JSStringRef code = JSStringCreateWithUTF8CString("new Uint8Array(__temp_buffer_data)");
-        JSObjectRef global = JSContextGetGlobalObject(ctx);
 
         // Store data temporarily
         JSValueRef* byte_values = malloc(sizeof(JSValueRef) * (actual_size - 1));
@@ -764,6 +763,37 @@ static JSValueRef js_buffer_from(JSContextRef ctx, JSObjectRef function __attrib
         return result;
     }
 
+    // For arrays, copy byte values
+    JSObjectRef obj = JSValueToObject(ctx, arguments[0], exception);
+    if (obj) {
+        JSStringRef length_name = JSStringCreateWithUTF8CString("length");
+        JSValueRef length_val = JSObjectGetProperty(ctx, obj, length_name, NULL);
+        JSStringRelease(length_name);
+
+        if (JSValueIsNumber(ctx, length_val)) {
+            size_t length = (size_t)JSValueToNumber(ctx, length_val, NULL);
+            JSValueRef* byte_values = malloc(sizeof(JSValueRef) * length);
+
+            for (size_t i = 0; i < length; i++) {
+                JSValueRef val = JSObjectGetPropertyAtIndex(ctx, obj, i, NULL);
+                byte_values[i] = JSValueMakeNumber(ctx, (unsigned char)JSValueToNumber(ctx, val, NULL));
+            }
+
+            JSObjectRef array = JSObjectMakeArray(ctx, length, byte_values, NULL);
+            free(byte_values);
+
+            JSStringRef temp_name = JSStringCreateWithUTF8CString("__temp_buffer_data");
+            JSObjectSetProperty(ctx, global, temp_name, array, kJSPropertyAttributeNone, NULL);
+            JSStringRelease(temp_name);
+
+            JSValueRef result = JSEvaluateScript(ctx, code, NULL, NULL, 1, exception);
+            JSStringRelease(code);
+
+            return result;
+        }
+    }
+
+    JSStringRelease(code);
     return JSValueMakeUndefined(ctx);
 }
 
@@ -3279,11 +3309,30 @@ static JSValueRef js_udp_send(JSContextRef ctx, JSObjectRef function __attribute
 
     int sock_fd = (int)JSValueToNumber(ctx, arguments[0], NULL);
 
-    JSStringRef msg_str = JSValueToStringCopy(ctx, arguments[1], exception);
-    size_t max_size = JSStringGetMaximumUTF8CStringSize(msg_str);
-    char* message = malloc(max_size);
-    JSStringGetUTF8CString(msg_str, message, max_size);
-    JSStringRelease(msg_str);
+    // Handle Buffer (Uint8Array) input
+    unsigned char* message = NULL;
+    size_t message_len = 0;
+
+    JSObjectRef msg_obj = JSValueToObject(ctx, arguments[1], exception);
+    if (msg_obj) {
+        JSStringRef length_name = JSStringCreateWithUTF8CString("length");
+        JSValueRef length_val = JSObjectGetProperty(ctx, msg_obj, length_name, NULL);
+        JSStringRelease(length_name);
+
+        if (JSValueIsNumber(ctx, length_val)) {
+            message_len = (size_t)JSValueToNumber(ctx, length_val, NULL);
+            message = malloc(message_len);
+
+            for (size_t i = 0; i < message_len; i++) {
+                JSValueRef byte_val = JSObjectGetPropertyAtIndex(ctx, msg_obj, i, NULL);
+                message[i] = (unsigned char)JSValueToNumber(ctx, byte_val, NULL);
+            }
+        }
+    }
+
+    if (!message) {
+        return JSValueMakeUndefined(ctx);
+    }
 
     int port = (int)JSValueToNumber(ctx, arguments[2], NULL);
 
@@ -3297,7 +3346,7 @@ static JSValueRef js_udp_send(JSContextRef ctx, JSObjectRef function __attribute
     dest_addr.sin_port = htons(port);
     inet_pton(AF_INET, address, &dest_addr.sin_addr);
 
-    sendto(sock_fd, message, strlen(message), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+    sendto(sock_fd, message, message_len, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
     free(message);
 
     return JSValueMakeUndefined(ctx);
@@ -3402,16 +3451,23 @@ static JSValueRef js_zlib_gzip(JSContextRef ctx, JSObjectRef function __attribut
         return JSValueMakeUndefined(ctx);
     }
 
-    // Get input data
-    JSStringRef data_str = JSValueToStringCopy(ctx, arguments[0], exception);
-    if (*exception) return JSValueMakeUndefined(ctx);
+    // Get input data from Buffer (Uint8Array)
+    JSObjectRef data_obj = JSValueToObject(ctx, arguments[0], exception);
+    if (!data_obj) return JSValueMakeUndefined(ctx);
 
-    size_t max_size = JSStringGetMaximumUTF8CStringSize(data_str);
-    char* data = malloc(max_size);
-    JSStringGetUTF8CString(data_str, data, max_size);
-    JSStringRelease(data_str);
+    JSStringRef length_name = JSStringCreateWithUTF8CString("length");
+    JSValueRef length_val = JSObjectGetProperty(ctx, data_obj, length_name, NULL);
+    JSStringRelease(length_name);
 
-    size_t data_len = strlen(data);
+    if (!JSValueIsNumber(ctx, length_val)) return JSValueMakeUndefined(ctx);
+
+    size_t data_len = (size_t)JSValueToNumber(ctx, length_val, NULL);
+    unsigned char* data = malloc(data_len);
+
+    for (size_t i = 0; i < data_len; i++) {
+        JSValueRef byte_val = JSObjectGetPropertyAtIndex(ctx, data_obj, i, NULL);
+        data[i] = (unsigned char)JSValueToNumber(ctx, byte_val, NULL);
+    }
 
     // Get callback
     JSObjectRef callback = JSValueToObject(ctx, arguments[1], exception);
@@ -3424,7 +3480,7 @@ static JSValueRef js_zlib_gzip(JSContextRef ctx, JSObjectRef function __attribut
     uLongf compressed_size = compressBound(data_len);
     unsigned char* compressed = malloc(compressed_size);
 
-    int result = compress2(compressed, &compressed_size, (const unsigned char*)data, data_len, Z_DEFAULT_COMPRESSION);
+    int result = compress2(compressed, &compressed_size, data, data_len, Z_DEFAULT_COMPRESSION);
     free(data);
 
     if (result != Z_OK) {
@@ -3438,11 +3494,23 @@ static JSValueRef js_zlib_gzip(JSContextRef ctx, JSObjectRef function __attribut
         return JSValueMakeUndefined(ctx);
     }
 
-    // Convert to string (base64 would be better, but for now just binary)
-    JSStringRef compressed_str = JSStringCreateWithUTF8CString((char*)compressed);
-    JSValueRef compressed_val = JSValueMakeString(ctx, compressed_str);
-    JSStringRelease(compressed_str);
+    // Create Buffer from compressed data
+    JSValueRef* byte_values = malloc(sizeof(JSValueRef) * compressed_size);
+    for (size_t i = 0; i < compressed_size; i++) {
+        byte_values[i] = JSValueMakeNumber(ctx, compressed[i]);
+    }
+    JSObjectRef byte_array = JSObjectMakeArray(ctx, compressed_size, byte_values, NULL);
+    free(byte_values);
     free(compressed);
+
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSStringRef temp_name = JSStringCreateWithUTF8CString("__temp_zlib_data");
+    JSObjectSetProperty(ctx, global, temp_name, byte_array, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(temp_name);
+
+    JSStringRef code = JSStringCreateWithUTF8CString("Buffer.from(__temp_zlib_data)");
+    JSValueRef compressed_val = JSEvaluateScript(ctx, code, NULL, NULL, 1, NULL);
+    JSStringRelease(code);
 
     // Call callback(null, compressed)
     JSValueRef args[] = {JSValueMakeNull(ctx), compressed_val};
@@ -3462,15 +3530,23 @@ static JSValueRef js_zlib_gunzip(JSContextRef ctx, JSObjectRef function __attrib
         return JSValueMakeUndefined(ctx);
     }
 
-    // Get input data
-    JSStringRef data_str = JSValueToStringCopy(ctx, arguments[0], exception);
-    if (*exception) return JSValueMakeUndefined(ctx);
+    // Get input data from Buffer (Uint8Array)
+    JSObjectRef data_obj = JSValueToObject(ctx, arguments[0], exception);
+    if (!data_obj) return JSValueMakeUndefined(ctx);
 
-    size_t max_size = JSStringGetMaximumUTF8CStringSize(data_str);
-    unsigned char* data = malloc(max_size);
-    JSStringGetUTF8CString(data_str, (char*)data, max_size);
-    size_t data_len = strlen((char*)data);
-    JSStringRelease(data_str);
+    JSStringRef length_name = JSStringCreateWithUTF8CString("length");
+    JSValueRef length_val = JSObjectGetProperty(ctx, data_obj, length_name, NULL);
+    JSStringRelease(length_name);
+
+    if (!JSValueIsNumber(ctx, length_val)) return JSValueMakeUndefined(ctx);
+
+    size_t data_len = (size_t)JSValueToNumber(ctx, length_val, NULL);
+    unsigned char* data = malloc(data_len);
+
+    for (size_t i = 0; i < data_len; i++) {
+        JSValueRef byte_val = JSObjectGetPropertyAtIndex(ctx, data_obj, i, NULL);
+        data[i] = (unsigned char)JSValueToNumber(ctx, byte_val, NULL);
+    }
 
     // Get callback
     JSObjectRef callback = JSValueToObject(ctx, arguments[1], exception);
@@ -3497,11 +3573,23 @@ static JSValueRef js_zlib_gunzip(JSContextRef ctx, JSObjectRef function __attrib
         return JSValueMakeUndefined(ctx);
     }
 
-    decompressed[decompressed_size] = '\0';
-    JSStringRef decompressed_str = JSStringCreateWithUTF8CString((char*)decompressed);
-    JSValueRef decompressed_val = JSValueMakeString(ctx, decompressed_str);
-    JSStringRelease(decompressed_str);
+    // Create Buffer from decompressed data
+    JSValueRef* byte_values = malloc(sizeof(JSValueRef) * decompressed_size);
+    for (size_t i = 0; i < decompressed_size; i++) {
+        byte_values[i] = JSValueMakeNumber(ctx, decompressed[i]);
+    }
+    JSObjectRef byte_array = JSObjectMakeArray(ctx, decompressed_size, byte_values, NULL);
+    free(byte_values);
     free(decompressed);
+
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSStringRef temp_name = JSStringCreateWithUTF8CString("__temp_zlib_data");
+    JSObjectSetProperty(ctx, global, temp_name, byte_array, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(temp_name);
+
+    JSStringRef code = JSStringCreateWithUTF8CString("Buffer.from(__temp_zlib_data)");
+    JSValueRef decompressed_val = JSEvaluateScript(ctx, code, NULL, NULL, 1, NULL);
+    JSStringRelease(code);
 
     // Call callback(null, decompressed)
     JSValueRef args[] = {JSValueMakeNull(ctx), decompressed_val};
@@ -5034,16 +5122,27 @@ void run_event_loop() {
                                                 (struct sockaddr*)&from_addr, &from_len);
 
                         if (bytes > 0 && udp_sock->on_message) {
-                            buffer[bytes] = '\0';
-
                             // Convert address to string
                             char from_ip[INET_ADDRSTRLEN];
                             inet_ntop(AF_INET, &from_addr.sin_addr, from_ip, sizeof(from_ip));
 
-                            // Create message buffer
-                            JSStringRef msg_str = JSStringCreateWithUTF8CString(buffer);
-                            JSValueRef msg_val = JSValueMakeString(global_ctx, msg_str);
-                            JSStringRelease(msg_str);
+                            // Create Buffer (Uint8Array) from received data
+                            JSValueRef* byte_values = malloc(sizeof(JSValueRef) * bytes);
+                            for (ssize_t i = 0; i < bytes; i++) {
+                                byte_values[i] = JSValueMakeNumber(global_ctx, (unsigned char)buffer[i]);
+                            }
+                            JSObjectRef byte_array = JSObjectMakeArray(global_ctx, bytes, byte_values, NULL);
+                            free(byte_values);
+
+                            // Create Uint8Array from array
+                            JSObjectRef global = JSContextGetGlobalObject(global_ctx);
+                            JSStringRef temp_name = JSStringCreateWithUTF8CString("__temp_udp_data");
+                            JSObjectSetProperty(global_ctx, global, temp_name, byte_array, kJSPropertyAttributeNone, NULL);
+                            JSStringRelease(temp_name);
+
+                            JSStringRef code = JSStringCreateWithUTF8CString("Buffer.from(__temp_udp_data)");
+                            JSValueRef msg_val = JSEvaluateScript(global_ctx, code, NULL, NULL, 1, NULL);
+                            JSStringRelease(code);
 
                             // Create rinfo object {address, port, family}
                             JSObjectRef rinfo = JSObjectMake(global_ctx, NULL, NULL);
