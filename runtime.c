@@ -6,10 +6,119 @@
 #include <limits.h>
 #include <unistd.h>
 #include <regex.h>
+#include <sys/time.h>
+#include <sys/event.h>
+#include <time.h>
 
 // Module cache
 static JSObjectRef module_cache = NULL;
 static char current_dir[PATH_MAX];
+
+// Event loop
+static JSGlobalContextRef global_ctx = NULL;
+static int kq = -1;
+
+// Timer structure
+typedef struct Timer {
+    int id;
+    uint64_t target_time_ms;
+    int interval_ms;
+    JSObjectRef callback;
+    int is_interval;
+    int cancelled;
+    struct Timer* next;
+} Timer;
+
+static Timer* timer_queue = NULL;
+static int next_timer_id = 1;
+
+// Get current time in milliseconds
+static uint64_t get_time_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+// Add timer to queue
+static void add_timer(Timer* timer) {
+    timer->next = timer_queue;
+    timer_queue = timer;
+    JSValueProtect(global_ctx, timer->callback);
+}
+
+// Remove timer from queue
+static void remove_timer(int id) {
+    Timer** current = &timer_queue;
+    while (*current) {
+        if ((*current)->id == id) {
+            (*current)->cancelled = 1;
+            return;
+        }
+        current = &(*current)->next;
+    }
+}
+
+// setTimeout implementation
+static JSValueRef js_set_timeout(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                  JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                  const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    if (argumentCount < 2) {
+        return JSValueMakeNumber(ctx, 0);
+    }
+
+    JSObjectRef callback = JSValueToObject(ctx, arguments[0], NULL);
+    int delay = (int)JSValueToNumber(ctx, arguments[1], NULL);
+
+    Timer* timer = malloc(sizeof(Timer));
+    timer->id = next_timer_id++;
+    timer->target_time_ms = get_time_ms() + delay;
+    timer->interval_ms = 0;
+    timer->callback = callback;
+    timer->is_interval = 0;
+    timer->cancelled = 0;
+
+    add_timer(timer);
+
+    return JSValueMakeNumber(ctx, timer->id);
+}
+
+// setInterval implementation
+static JSValueRef js_set_interval(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                   const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    if (argumentCount < 2) {
+        return JSValueMakeNumber(ctx, 0);
+    }
+
+    JSObjectRef callback = JSValueToObject(ctx, arguments[0], NULL);
+    int interval = (int)JSValueToNumber(ctx, arguments[1], NULL);
+
+    Timer* timer = malloc(sizeof(Timer));
+    timer->id = next_timer_id++;
+    timer->target_time_ms = get_time_ms() + interval;
+    timer->interval_ms = interval;
+    timer->callback = callback;
+    timer->is_interval = 1;
+    timer->cancelled = 0;
+
+    add_timer(timer);
+
+    return JSValueMakeNumber(ctx, timer->id);
+}
+
+// clearTimeout/clearInterval implementation
+static JSValueRef js_clear_timer(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                  JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                  const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int id = (int)JSValueToNumber(ctx, arguments[0], NULL);
+    remove_timer(id);
+
+    return JSValueMakeUndefined(ctx);
+}
 
 // Console.log implementation
 static JSValueRef js_console_log(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
@@ -43,6 +152,98 @@ void setup_console(JSContextRef ctx, JSObjectRef global) {
     JSStringRef console_name = JSStringCreateWithUTF8CString("console");
     JSObjectSetProperty(ctx, global, console_name, console, kJSPropertyAttributeNone, NULL);
     JSStringRelease(console_name);
+}
+
+void setup_timers(JSContextRef ctx, JSObjectRef global) {
+    JSStringRef setTimeout_name = JSStringCreateWithUTF8CString("setTimeout");
+    JSObjectRef setTimeout_func = JSObjectMakeFunctionWithCallback(ctx, setTimeout_name, js_set_timeout);
+    JSObjectSetProperty(ctx, global, setTimeout_name, setTimeout_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(setTimeout_name);
+
+    JSStringRef setInterval_name = JSStringCreateWithUTF8CString("setInterval");
+    JSObjectRef setInterval_func = JSObjectMakeFunctionWithCallback(ctx, setInterval_name, js_set_interval);
+    JSObjectSetProperty(ctx, global, setInterval_name, setInterval_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(setInterval_name);
+
+    JSStringRef clearTimeout_name = JSStringCreateWithUTF8CString("clearTimeout");
+    JSObjectRef clearTimeout_func = JSObjectMakeFunctionWithCallback(ctx, clearTimeout_name, js_clear_timer);
+    JSObjectSetProperty(ctx, global, clearTimeout_name, clearTimeout_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(clearTimeout_name);
+
+    JSStringRef clearInterval_name = JSStringCreateWithUTF8CString("clearInterval");
+    JSObjectRef clearInterval_func = JSObjectMakeFunctionWithCallback(ctx, clearInterval_name, js_clear_timer);
+    JSObjectSetProperty(ctx, global, clearInterval_name, clearInterval_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(clearInterval_name);
+}
+
+// Event loop - process timers
+void run_event_loop() {
+    kq = kqueue();
+    if (kq == -1) {
+        return;
+    }
+
+    while (timer_queue) {
+        // Find next timer to fire
+        Timer* next = NULL;
+        uint64_t now = get_time_ms();
+        uint64_t min_time = UINT64_MAX;
+
+        Timer* current = timer_queue;
+        while (current) {
+            if (!current->cancelled && current->target_time_ms < min_time) {
+                min_time = current->target_time_ms;
+                next = current;
+            }
+            current = current->next;
+        }
+
+        if (!next) break;
+
+        // Wait until timer is ready
+        now = get_time_ms();
+        if (next->target_time_ms > now) {
+            usleep((next->target_time_ms - now) * 1000);
+        }
+
+        // Execute callback
+        if (!next->cancelled) {
+            JSValueRef exception = NULL;
+            JSObjectCallAsFunction(global_ctx, next->callback, NULL, 0, NULL, &exception);
+
+            if (exception) {
+                JSStringRef js_error = JSValueToStringCopy(global_ctx, exception, NULL);
+                size_t max_size = JSStringGetMaximumUTF8CStringSize(js_error);
+                char* error_buffer = malloc(max_size);
+                JSStringGetUTF8CString(js_error, error_buffer, max_size);
+                fprintf(stderr, "Timer error: %s\n", error_buffer);
+                free(error_buffer);
+                JSStringRelease(js_error);
+            }
+
+            // Reschedule if interval
+            if (next->is_interval) {
+                next->target_time_ms = get_time_ms() + next->interval_ms;
+            } else {
+                next->cancelled = 1;
+            }
+        }
+
+        // Clean up cancelled timers
+        Timer** ptr = &timer_queue;
+        while (*ptr) {
+            if ((*ptr)->cancelled) {
+                Timer* to_free = *ptr;
+                *ptr = (*ptr)->next;
+                JSValueUnprotect(global_ctx, to_free->callback);
+                free(to_free);
+            } else {
+                ptr = &(*ptr)->next;
+            }
+        }
+    }
+
+    close(kq);
 }
 
 static char* read_file(const char* path) {
@@ -364,6 +565,7 @@ int main(int argc, char* argv[]) {
 
     // Create JavaScript context
     JSGlobalContextRef ctx = JSGlobalContextCreate(NULL);
+    global_ctx = ctx;  // Store for event loop
     JSObjectRef global = JSContextGetGlobalObject(ctx);
 
     // Initialize module cache
@@ -377,6 +579,7 @@ int main(int argc, char* argv[]) {
 
     // Setup runtime APIs
     setup_console(ctx, global);
+    setup_timers(ctx, global);
 
     // Setup __krandog_import for module loading
     JSStringRef import_name = JSStringCreateWithUTF8CString("__krandog_import");
@@ -415,6 +618,9 @@ int main(int argc, char* argv[]) {
         JSGlobalContextRelease(ctx);
         return 1;
     }
+
+    // Run event loop to process timers
+    run_event_loop();
 
     JSGlobalContextRelease(ctx);
     return 0;
