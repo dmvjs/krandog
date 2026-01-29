@@ -1,7 +1,7 @@
 // Test: Fetch JSON API
-fetch('https://api.github.com/users/github').then(response => {
+fetch('https://httpbin.org/json').then(response => {
     return response.json();
 }).then(data => {
-    console.log(data.login);
-    console.log(typeof data.id);
+    console.log(data.slideshow.author);
+    console.log(typeof data.slideshow.slides.length);
 });
