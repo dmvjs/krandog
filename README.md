@@ -50,6 +50,7 @@ macos only.
 - promises and microtasks
 - fetch (libcurl)
 - http server
+- http/https modules
 - websockets (client + server)
 - net (tcp sockets)
 - crypto (hash, hmac, random)
@@ -117,6 +118,24 @@ path.dirname('/foo/bar')
 serve(3000, (req) => {
     console.log(req.method, req.url);
     return { status: 200, body: 'hello' };
+});
+```
+
+### http/https modules
+```javascript
+import http from 'http';
+import https from 'https';
+
+// http server
+const server = http.createServer((req) => {
+    return { status: 200, body: 'hello' };
+});
+server.listen(3000);
+
+// https client
+https.get('https://api.example.com/data', (res) => {
+    console.log(res.status);
+    res.on('data', (data) => console.log(data));
 });
 ```
 
@@ -366,7 +385,7 @@ make test
 
 ## what's missing
 
-typescript, bundler, more node apis (dns, tls/https, zlib, stream base classes).
+typescript, bundler, more node apis (dns, tls sockets, zlib, dgram/udp, stream base classes).
 
 good enough for cli tools, scripts, networking, real-time apps, and most npm packages.
 

@@ -19,6 +19,8 @@
 #include <fcntl.h>
 #include <CommonCrypto/CommonCrypto.h>
 #include <sys/sysctl.h>
+#include <Security/Security.h>
+#include <Security/SecureTransport.h>
 
 // Module cache
 static JSObjectRef module_cache = NULL;
@@ -3000,6 +3002,67 @@ static JSObjectRef create_events_module(JSContextRef ctx) {
     return events;
 }
 
+// Create http module object
+static JSObjectRef create_http_module(JSContextRef ctx) {
+    JSObjectRef http = JSObjectMake(ctx, NULL, NULL);
+
+    // http.createServer() - wraps serve()
+    const char* createServer_code =
+        "(function() {"
+        "  return function(handler) {"
+        "    return {"
+        "      listen: function(port, callback) {"
+        "        serve(port, handler);"
+        "        if (callback) callback();"
+        "      }"
+        "    };"
+        "  };"
+        "})()";
+
+    JSStringRef code_str = JSStringCreateWithUTF8CString(createServer_code);
+    JSValueRef createServer_func = JSEvaluateScript(ctx, code_str, NULL, NULL, 1, NULL);
+    JSStringRelease(code_str);
+
+    JSStringRef createServer_name = JSStringCreateWithUTF8CString("createServer");
+    JSObjectSetProperty(ctx, http, createServer_name, createServer_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(createServer_name);
+
+    return http;
+}
+
+// Create https module object
+static JSObjectRef create_https_module(JSContextRef ctx) {
+    JSObjectRef https = JSObjectMake(ctx, NULL, NULL);
+
+    // https.get() - wraps fetch()
+    const char* get_code =
+        "(function() {"
+        "  return function(url, callback) {"
+        "    fetch(url).then(res => {"
+        "      res.on = function(event, cb) {"
+        "        if (event === 'data') res.text().then(cb);"
+        "      };"
+        "      if (callback) callback(res);"
+        "    });"
+        "  };"
+        "})()";
+
+    JSStringRef code_str = JSStringCreateWithUTF8CString(get_code);
+    JSValueRef get_func = JSEvaluateScript(ctx, code_str, NULL, NULL, 1, NULL);
+    JSStringRelease(code_str);
+
+    JSStringRef get_name = JSStringCreateWithUTF8CString("get");
+    JSObjectSetProperty(ctx, https, get_name, get_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(get_name);
+
+    // https.request() - similar to get()
+    JSStringRef request_name = JSStringCreateWithUTF8CString("request");
+    JSObjectSetProperty(ctx, https, request_name, get_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(request_name);
+
+    return https;
+}
+
 // Generate WebSocket accept key from Sec-WebSocket-Key
 static void ws_generate_accept_key(const char* client_key, char* accept_key) {
     char combined[256];
@@ -4955,7 +5018,8 @@ static JSValueRef js_krandog_import(JSContextRef ctx, JSObjectRef function __att
         strcmp(actual_module, "child_process") == 0 || strcmp(actual_module, "crypto") == 0 ||
         strcmp(actual_module, "net") == 0 || strcmp(actual_module, "url") == 0 ||
         strcmp(actual_module, "util") == 0 || strcmp(actual_module, "events") == 0 ||
-        strcmp(actual_module, "os") == 0) {
+        strcmp(actual_module, "os") == 0 || strcmp(actual_module, "http") == 0 ||
+        strcmp(actual_module, "https") == 0) {
         JSValueRef result = load_es_module(ctx, actual_module, exception);
         free(module_path);
         return result;
@@ -5166,7 +5230,8 @@ static JSValueRef load_es_module(JSContextRef ctx, const char* path, JSValueRef*
     // Check for built-in modules
     if (strcmp(path, "fs") == 0 || strcmp(path, "path") == 0 || strcmp(path, "child_process") == 0 ||
         strcmp(path, "crypto") == 0 || strcmp(path, "net") == 0 || strcmp(path, "url") == 0 ||
-        strcmp(path, "util") == 0 || strcmp(path, "events") == 0 || strcmp(path, "os") == 0) {
+        strcmp(path, "util") == 0 || strcmp(path, "events") == 0 || strcmp(path, "os") == 0 ||
+        strcmp(path, "http") == 0 || strcmp(path, "https") == 0) {
         JSStringRef cache_key = JSStringCreateWithUTF8CString(path);
         JSValueRef cached = JSObjectGetProperty(ctx, module_cache, cache_key, NULL);
 
@@ -5192,6 +5257,10 @@ static JSValueRef load_es_module(JSContextRef ctx, const char* path, JSValueRef*
             builtin_module = create_events_module(ctx);
         } else if (strcmp(path, "os") == 0) {
             builtin_module = create_os_module(ctx);
+        } else if (strcmp(path, "http") == 0) {
+            builtin_module = create_http_module(ctx);
+        } else if (strcmp(path, "https") == 0) {
+            builtin_module = create_https_module(ctx);
         } else {
             builtin_module = create_child_process_module(ctx);
         }
