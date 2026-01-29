@@ -18,6 +18,15 @@ static char current_dir[PATH_MAX];
 static JSGlobalContextRef global_ctx = NULL;
 static int kq = -1;
 
+// Microtask queue
+typedef struct Microtask {
+    JSObjectRef callback;
+    struct Microtask* next;
+} Microtask;
+
+static Microtask* microtask_queue = NULL;
+static Microtask* microtask_queue_tail = NULL;
+
 // Timer structure
 typedef struct Timer {
     int id;
@@ -120,6 +129,60 @@ static JSValueRef js_clear_timer(JSContextRef ctx, JSObjectRef function __attrib
     return JSValueMakeUndefined(ctx);
 }
 
+// queueMicrotask implementation
+static JSValueRef js_queue_microtask(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                      JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                      const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef callback = JSValueToObject(ctx, arguments[0], NULL);
+
+    Microtask* task = malloc(sizeof(Microtask));
+    task->callback = callback;
+    task->next = NULL;
+    JSValueProtect(global_ctx, callback);
+
+    // Add to queue
+    if (microtask_queue_tail) {
+        microtask_queue_tail->next = task;
+        microtask_queue_tail = task;
+    } else {
+        microtask_queue = task;
+        microtask_queue_tail = task;
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// Drain microtask queue
+static void drain_microtasks() {
+    while (microtask_queue) {
+        Microtask* task = microtask_queue;
+        microtask_queue = task->next;
+        if (!microtask_queue) {
+            microtask_queue_tail = NULL;
+        }
+
+        JSValueRef exception = NULL;
+        JSObjectCallAsFunction(global_ctx, task->callback, NULL, 0, NULL, &exception);
+
+        if (exception) {
+            JSStringRef js_error = JSValueToStringCopy(global_ctx, exception, NULL);
+            size_t max_size = JSStringGetMaximumUTF8CStringSize(js_error);
+            char* error_buffer = malloc(max_size);
+            JSStringGetUTF8CString(js_error, error_buffer, max_size);
+            fprintf(stderr, "Microtask error: %s\n", error_buffer);
+            free(error_buffer);
+            JSStringRelease(js_error);
+        }
+
+        JSValueUnprotect(global_ctx, task->callback);
+        free(task);
+    }
+}
+
 // Console.log implementation
 static JSValueRef js_console_log(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
@@ -174,14 +237,22 @@ void setup_timers(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef clearInterval_func = JSObjectMakeFunctionWithCallback(ctx, clearInterval_name, js_clear_timer);
     JSObjectSetProperty(ctx, global, clearInterval_name, clearInterval_func, kJSPropertyAttributeNone, NULL);
     JSStringRelease(clearInterval_name);
+
+    JSStringRef queueMicrotask_name = JSStringCreateWithUTF8CString("queueMicrotask");
+    JSObjectRef queueMicrotask_func = JSObjectMakeFunctionWithCallback(ctx, queueMicrotask_name, js_queue_microtask);
+    JSObjectSetProperty(ctx, global, queueMicrotask_name, queueMicrotask_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(queueMicrotask_name);
 }
 
-// Event loop - process timers
+// Event loop - process timers and microtasks
 void run_event_loop() {
     kq = kqueue();
     if (kq == -1) {
         return;
     }
+
+    // Drain initial microtasks from script execution
+    drain_microtasks();
 
     while (timer_queue) {
         // Find next timer to fire
@@ -206,7 +277,7 @@ void run_event_loop() {
             usleep((next->target_time_ms - now) * 1000);
         }
 
-        // Execute callback
+        // Execute callback (macrotask)
         if (!next->cancelled) {
             JSValueRef exception = NULL;
             JSObjectCallAsFunction(global_ctx, next->callback, NULL, 0, NULL, &exception);
@@ -220,6 +291,9 @@ void run_event_loop() {
                 free(error_buffer);
                 JSStringRelease(js_error);
             }
+
+            // Drain microtasks after each macrotask
+            drain_microtasks();
 
             // Reschedule if interval
             if (next->is_interval) {
@@ -242,6 +316,9 @@ void run_event_loop() {
             }
         }
     }
+
+    // Final microtask drain
+    drain_microtasks();
 
     close(kq);
 }
