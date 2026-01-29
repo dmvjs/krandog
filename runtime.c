@@ -9,6 +9,9 @@
 #include <sys/time.h>
 #include <sys/event.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
 
 // Module cache
 static JSObjectRef module_cache = NULL;
@@ -17,6 +20,9 @@ static char current_dir[PATH_MAX];
 // Event loop
 static JSGlobalContextRef global_ctx = NULL;
 static int kq = -1;
+
+// Forward declarations
+static char* read_file(const char* path);
 
 // Microtask queue
 typedef struct Microtask {
@@ -181,6 +187,289 @@ static void drain_microtasks() {
         JSValueUnprotect(global_ctx, task->callback);
         free(task);
     }
+}
+
+// fs.readFileSync
+static JSValueRef js_fs_read_file_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                        JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                        const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    char* content = read_file(path);
+    free(path);
+
+    if (!content) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("File not found");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef result_str = JSStringCreateWithUTF8CString(content);
+    JSValueRef result = JSValueMakeString(ctx, result_str);
+    JSStringRelease(result_str);
+    free(content);
+
+    return result;
+}
+
+// fs.writeFileSync
+static JSValueRef js_fs_write_file_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                         JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                         const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 2) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t path_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(path_size);
+    JSStringGetUTF8CString(path_str, path, path_size);
+    JSStringRelease(path_str);
+
+    JSStringRef data_str = JSValueToStringCopy(ctx, arguments[1], exception);
+    if (*exception) {
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t data_size = JSStringGetMaximumUTF8CStringSize(data_str);
+    char* data = malloc(data_size);
+    JSStringGetUTF8CString(data_str, data, data_size);
+    JSStringRelease(data_str);
+
+    FILE* file = fopen(path, "w");
+    if (!file) {
+        free(path);
+        free(data);
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot write file");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    fputs(data, file);
+    fclose(file);
+    free(path);
+    free(data);
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// fs.existsSync
+static JSValueRef js_fs_exists_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                     JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                     const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeBoolean(ctx, false);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeBoolean(ctx, false);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    struct stat st;
+    int exists = stat(path, &st) == 0;
+    free(path);
+
+    return JSValueMakeBoolean(ctx, exists);
+}
+
+// fs.readdirSync
+static JSValueRef js_fs_readdir_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                      JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                      const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    DIR* dir = opendir(path);
+    free(path);
+
+    if (!dir) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot read directory");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef* items = NULL;
+    size_t count = 0;
+    size_t capacity = 16;
+    items = malloc(sizeof(JSValueRef) * capacity);
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        if (count >= capacity) {
+            capacity *= 2;
+            items = realloc(items, sizeof(JSValueRef) * capacity);
+        }
+
+        JSStringRef name_str = JSStringCreateWithUTF8CString(entry->d_name);
+        items[count++] = JSValueMakeString(ctx, name_str);
+        JSStringRelease(name_str);
+    }
+
+    closedir(dir);
+
+    JSObjectRef array = JSObjectMakeArray(ctx, count, items, exception);
+    free(items);
+
+    return array;
+}
+
+// fs.mkdirSync
+static JSValueRef js_fs_mkdir_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                    JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                    const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    int result = mkdir(path, 0755);
+    free(path);
+
+    if (result != 0) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot create directory");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// fs.rmdirSync
+static JSValueRef js_fs_rmdir_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                    JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                    const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    int result = rmdir(path);
+    free(path);
+
+    if (result != 0) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot remove directory");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// fs.unlinkSync
+static JSValueRef js_fs_unlink_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                     JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                     const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    int result = unlink(path);
+    free(path);
+
+    if (result != 0) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot delete file");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// Create fs module object
+static JSObjectRef create_fs_module(JSContextRef ctx) {
+    JSObjectRef fs = JSObjectMake(ctx, NULL, NULL);
+
+    JSStringRef readFileSync_name = JSStringCreateWithUTF8CString("readFileSync");
+    JSObjectRef readFileSync_func = JSObjectMakeFunctionWithCallback(ctx, readFileSync_name, js_fs_read_file_sync);
+    JSObjectSetProperty(ctx, fs, readFileSync_name, readFileSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(readFileSync_name);
+
+    JSStringRef writeFileSync_name = JSStringCreateWithUTF8CString("writeFileSync");
+    JSObjectRef writeFileSync_func = JSObjectMakeFunctionWithCallback(ctx, writeFileSync_name, js_fs_write_file_sync);
+    JSObjectSetProperty(ctx, fs, writeFileSync_name, writeFileSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(writeFileSync_name);
+
+    JSStringRef existsSync_name = JSStringCreateWithUTF8CString("existsSync");
+    JSObjectRef existsSync_func = JSObjectMakeFunctionWithCallback(ctx, existsSync_name, js_fs_exists_sync);
+    JSObjectSetProperty(ctx, fs, existsSync_name, existsSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(existsSync_name);
+
+    JSStringRef readdirSync_name = JSStringCreateWithUTF8CString("readdirSync");
+    JSObjectRef readdirSync_func = JSObjectMakeFunctionWithCallback(ctx, readdirSync_name, js_fs_readdir_sync);
+    JSObjectSetProperty(ctx, fs, readdirSync_name, readdirSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(readdirSync_name);
+
+    JSStringRef mkdirSync_name = JSStringCreateWithUTF8CString("mkdirSync");
+    JSObjectRef mkdirSync_func = JSObjectMakeFunctionWithCallback(ctx, mkdirSync_name, js_fs_mkdir_sync);
+    JSObjectSetProperty(ctx, fs, mkdirSync_name, mkdirSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(mkdirSync_name);
+
+    JSStringRef rmdirSync_name = JSStringCreateWithUTF8CString("rmdirSync");
+    JSObjectRef rmdirSync_func = JSObjectMakeFunctionWithCallback(ctx, rmdirSync_name, js_fs_rmdir_sync);
+    JSObjectSetProperty(ctx, fs, rmdirSync_name, rmdirSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(rmdirSync_name);
+
+    JSStringRef unlinkSync_name = JSStringCreateWithUTF8CString("unlinkSync");
+    JSObjectRef unlinkSync_func = JSObjectMakeFunctionWithCallback(ctx, unlinkSync_name, js_fs_unlink_sync);
+    JSObjectSetProperty(ctx, fs, unlinkSync_name, unlinkSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(unlinkSync_name);
+
+    return fs;
 }
 
 // Console.log implementation
@@ -376,6 +665,13 @@ static JSValueRef js_krandog_import(JSContextRef ctx, JSObjectRef function __att
     JSStringGetUTF8CString(path_str, module_path, max_size);
     JSStringRelease(path_str);
 
+    // Check for built-in modules
+    if (strcmp(module_path, "fs") == 0) {
+        JSValueRef result = load_es_module(ctx, module_path, exception);
+        free(module_path);
+        return result;
+    }
+
     char* resolved_path = resolve_module(current_dir, module_path);
     free(module_path);
 
@@ -570,6 +866,29 @@ static char* transpile_es_module(const char* source) {
 }
 
 static JSValueRef load_es_module(JSContextRef ctx, const char* path, JSValueRef* exception) {
+    // Check for built-in modules
+    if (strcmp(path, "fs") == 0) {
+        JSStringRef cache_key = JSStringCreateWithUTF8CString(path);
+        JSValueRef cached = JSObjectGetProperty(ctx, module_cache, cache_key, NULL);
+
+        if (!JSValueIsUndefined(ctx, cached)) {
+            JSStringRelease(cache_key);
+            return cached;
+        }
+
+        JSObjectRef fs_module = create_fs_module(ctx);
+
+        // Wrap in module exports object with default property
+        JSObjectRef exports = JSObjectMake(ctx, NULL, NULL);
+        JSStringRef default_name = JSStringCreateWithUTF8CString("default");
+        JSObjectSetProperty(ctx, exports, default_name, fs_module, kJSPropertyAttributeNone, NULL);
+        JSStringRelease(default_name);
+
+        JSObjectSetProperty(ctx, module_cache, cache_key, exports, kJSPropertyAttributeNone, NULL);
+        JSStringRelease(cache_key);
+        return exports;
+    }
+
     // Check cache
     JSStringRef cache_key = JSStringCreateWithUTF8CString(path);
     JSValueRef cached = JSObjectGetProperty(ctx, module_cache, cache_key, NULL);
