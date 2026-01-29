@@ -24,6 +24,10 @@ static int kq = -1;
 // Forward declarations
 static char* read_file(const char* path);
 
+// Store argc/argv for process object
+static int global_argc = 0;
+static char** global_argv = NULL;
+
 // Microtask queue
 typedef struct Microtask {
     JSObjectRef callback;
@@ -494,6 +498,60 @@ static JSValueRef js_console_log(JSContextRef ctx, JSObjectRef function __attrib
     return JSValueMakeUndefined(ctx);
 }
 
+// process.exit
+static JSValueRef js_process_exit(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                   const JSValueRef arguments[], JSValueRef* exception __attribute__((unused))) {
+    int code = 0;
+    if (argumentCount > 0) {
+        code = (int)JSValueToNumber(ctx, arguments[0], NULL);
+    }
+    exit(code);
+    return JSValueMakeUndefined(ctx);
+}
+
+// process.cwd
+static JSValueRef js_process_cwd(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                  JSObjectRef thisObject __attribute__((unused)), size_t argumentCount __attribute__((unused)),
+                                  const JSValueRef arguments[] __attribute__((unused)), JSValueRef* exception __attribute__((unused))) {
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd))) {
+        JSStringRef cwd_str = JSStringCreateWithUTF8CString(cwd);
+        JSValueRef result = JSValueMakeString(ctx, cwd_str);
+        JSStringRelease(cwd_str);
+        return result;
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+// process.chdir
+static JSValueRef js_process_chdir(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                    JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                    const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    int result = chdir(path);
+    free(path);
+
+    if (result != 0) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot change directory");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
 void setup_console(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef console = JSObjectMake(ctx, NULL, NULL);
     JSStringRef log_name = JSStringCreateWithUTF8CString("log");
@@ -504,6 +562,88 @@ void setup_console(JSContextRef ctx, JSObjectRef global) {
     JSStringRef console_name = JSStringCreateWithUTF8CString("console");
     JSObjectSetProperty(ctx, global, console_name, console, kJSPropertyAttributeNone, NULL);
     JSStringRelease(console_name);
+}
+
+void setup_process(JSContextRef ctx, JSObjectRef global) {
+    JSObjectRef process = JSObjectMake(ctx, NULL, NULL);
+
+    // process.argv
+    JSValueRef* argv_values = malloc(sizeof(JSValueRef) * global_argc);
+    for (int i = 0; i < global_argc; i++) {
+        JSStringRef arg_str = JSStringCreateWithUTF8CString(global_argv[i]);
+        argv_values[i] = JSValueMakeString(ctx, arg_str);
+        JSStringRelease(arg_str);
+    }
+    JSObjectRef argv_array = JSObjectMakeArray(ctx, global_argc, argv_values, NULL);
+    free(argv_values);
+
+    JSStringRef argv_name = JSStringCreateWithUTF8CString("argv");
+    JSObjectSetProperty(ctx, process, argv_name, argv_array, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(argv_name);
+
+    // process.env
+    JSObjectRef env = JSObjectMake(ctx, NULL, NULL);
+    extern char** environ;
+    for (char** env_ptr = environ; *env_ptr != NULL; env_ptr++) {
+        char* env_str = *env_ptr;
+        char* equals = strchr(env_str, '=');
+        if (equals) {
+            size_t key_len = equals - env_str;
+            char* key = malloc(key_len + 1);
+            strncpy(key, env_str, key_len);
+            key[key_len] = '\0';
+
+            char* value = equals + 1;
+
+            JSStringRef key_js = JSStringCreateWithUTF8CString(key);
+            JSStringRef value_js = JSStringCreateWithUTF8CString(value);
+            JSObjectSetProperty(ctx, env, key_js, JSValueMakeString(ctx, value_js), kJSPropertyAttributeNone, NULL);
+            JSStringRelease(key_js);
+            JSStringRelease(value_js);
+            free(key);
+        }
+    }
+
+    JSStringRef env_name = JSStringCreateWithUTF8CString("env");
+    JSObjectSetProperty(ctx, process, env_name, env, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(env_name);
+
+    // process.platform
+    JSStringRef platform_name = JSStringCreateWithUTF8CString("platform");
+    JSStringRef platform_value = JSStringCreateWithUTF8CString("darwin");
+    JSObjectSetProperty(ctx, process, platform_name, JSValueMakeString(ctx, platform_value), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(platform_name);
+    JSStringRelease(platform_value);
+
+    // process.version
+    JSStringRef version_name = JSStringCreateWithUTF8CString("version");
+    JSStringRef version_value = JSStringCreateWithUTF8CString("krandog-0.1.0");
+    JSObjectSetProperty(ctx, process, version_name, JSValueMakeString(ctx, version_value), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(version_name);
+    JSStringRelease(version_value);
+
+    // process.exit
+    JSStringRef exit_name = JSStringCreateWithUTF8CString("exit");
+    JSObjectRef exit_func = JSObjectMakeFunctionWithCallback(ctx, exit_name, js_process_exit);
+    JSObjectSetProperty(ctx, process, exit_name, exit_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(exit_name);
+
+    // process.cwd
+    JSStringRef cwd_name = JSStringCreateWithUTF8CString("cwd");
+    JSObjectRef cwd_func = JSObjectMakeFunctionWithCallback(ctx, cwd_name, js_process_cwd);
+    JSObjectSetProperty(ctx, process, cwd_name, cwd_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(cwd_name);
+
+    // process.chdir
+    JSStringRef chdir_name = JSStringCreateWithUTF8CString("chdir");
+    JSObjectRef chdir_func = JSObjectMakeFunctionWithCallback(ctx, chdir_name, js_process_chdir);
+    JSObjectSetProperty(ctx, process, chdir_name, chdir_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(chdir_name);
+
+    // Attach to global
+    JSStringRef process_name = JSStringCreateWithUTF8CString("process");
+    JSObjectSetProperty(ctx, global, process_name, process, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(process_name);
 }
 
 void setup_timers(JSContextRef ctx, JSObjectRef global) {
@@ -946,6 +1086,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Store argc/argv globally for process object
+    global_argc = argc;
+    global_argv = argv;
+
     char* script_path = realpath(argv[1], NULL);
     if (!script_path) {
         fprintf(stderr, "Error: Cannot resolve path '%s'\n", argv[1]);
@@ -976,6 +1120,7 @@ int main(int argc, char* argv[]) {
     // Setup runtime APIs
     setup_console(ctx, global);
     setup_timers(ctx, global);
+    setup_process(ctx, global);
 
     // Setup __krandog_import for module loading
     JSStringRef import_name = JSStringCreateWithUTF8CString("__krandog_import");
