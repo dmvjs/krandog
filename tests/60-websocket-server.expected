@@ -1,0 +1,5 @@
+Testing WebSocket-capable HTTP server
+Server listening on http://localhost:9080
+Server started on port 9080
+Server can handle both HTTP and WebSocket
+Test complete

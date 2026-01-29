@@ -1,0 +1,5 @@
+WebSocket broadcast server test
+Server listening on http://localhost:9082
+Broadcast server ready on port 9082
+Server supports multiple concurrent clients
+Test complete

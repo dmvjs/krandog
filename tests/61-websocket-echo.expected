@@ -1,0 +1,6 @@
+WebSocket echo server test
+Server will echo all WebSocket messages
+Server listening on http://localhost:9081
+Echo server ready on port 9081
+Test server is running
+Server verified running
