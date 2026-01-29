@@ -190,6 +190,52 @@ typedef struct TcpServer {
 
 static TcpServer* tcp_server_list = NULL;
 
+// TLS/SSL structures
+typedef enum {
+    TLS_STATE_NONE = 0,
+    TLS_STATE_HANDSHAKING,
+    TLS_STATE_CONNECTED,
+    TLS_STATE_CLOSED
+} TlsState;
+
+typedef struct TlsContext {
+    SSLContextRef ssl_ctx;
+    TlsState state;
+    int socket_fd;
+    SecIdentityRef identity;
+    char* pending_write_data;
+    size_t pending_write_len;
+    char read_buffer[65536];
+    size_t read_buffer_len;
+    int is_server;
+} TlsContext;
+
+typedef struct HttpsServer {
+    int socket_fd;
+    int port;
+    JSObjectRef handler;
+    TlsContext* tls_template;
+    struct HttpsServer* next;
+} HttpsServer;
+
+typedef struct TlsSocket {
+    int socket_fd;
+    TlsContext* tls_ctx;
+    int is_server;
+    int connecting;
+    JSObjectRef handler;  // For HTTPS servers - the request handler function
+    JSObjectRef on_secure_connect;
+    JSObjectRef on_data;
+    JSObjectRef on_end;
+    JSObjectRef on_error;
+    char read_buffer[8192];  // Buffer for reading HTTP request
+    size_t read_buffer_len;
+    struct TlsSocket* next;
+} TlsSocket;
+
+static HttpsServer* https_server_list = NULL;
+static TlsSocket* tls_socket_list = NULL;
+
 // Get current time in milliseconds
 static uint64_t get_time_ms() {
     struct timeval tv;
@@ -348,22 +394,96 @@ static JSValueRef js_fs_read_file_sync(JSContextRef ctx, JSObjectRef function __
     JSStringGetUTF8CString(path_str, path, max_size);
     JSStringRelease(path_str);
 
-    char* content = read_file(path);
-    free(path);
-
-    if (!content) {
-        JSStringRef error_str = JSStringCreateWithUTF8CString("File not found");
-        *exception = JSValueMakeString(ctx, error_str);
-        JSStringRelease(error_str);
-        return JSValueMakeUndefined(ctx);
+    // Check if we should return binary data (Buffer)
+    // If no options or options is string, read as text
+    // If options is object or null, return Buffer
+    int return_buffer = 0;
+    if (argumentCount >= 2) {
+        // Has options parameter - check if it's null or an object
+        if (JSValueIsNull(ctx, arguments[1]) || JSValueIsObject(ctx, arguments[1])) {
+            return_buffer = 1;
+        }
+    } else {
+        // No options, but check file extension - .p12, .pfx, .der should be binary
+        if (strstr(path, ".p12") || strstr(path, ".pfx") || strstr(path, ".der") ||
+            strstr(path, ".bin") || strstr(path, ".key")) {
+            return_buffer = 1;
+        }
     }
 
-    JSStringRef result_str = JSStringCreateWithUTF8CString(content);
-    JSValueRef result = JSValueMakeString(ctx, result_str);
-    JSStringRelease(result_str);
-    free(content);
+    if (return_buffer) {
+        // Read as binary and return Buffer (Uint8Array)
+        FILE* file = fopen(path, "rb");
+        free(path);
 
-    return result;
+        if (!file) {
+            JSStringRef error_str = JSStringCreateWithUTF8CString("File not found");
+            *exception = JSValueMakeString(ctx, error_str);
+            JSStringRelease(error_str);
+            return JSValueMakeUndefined(ctx);
+        }
+
+        // Get file size
+        fseek(file, 0, SEEK_END);
+        long file_size = ftell(file);
+        fseek(file, 0, SEEK_SET);
+
+        // Read file data
+        unsigned char* data = malloc(file_size);
+        size_t bytes_read = fread(data, 1, file_size, file);
+        fclose(file);
+
+        if (bytes_read != (size_t)file_size) {
+            free(data);
+            JSStringRef error_str = JSStringCreateWithUTF8CString("Failed to read file");
+            *exception = JSValueMakeString(ctx, error_str);
+            JSStringRelease(error_str);
+            return JSValueMakeUndefined(ctx);
+        }
+
+        // Create Uint8Array
+        JSObjectRef array = JSObjectMakeTypedArray(ctx, kJSTypedArrayTypeUint8Array, file_size, exception);
+        if (*exception) {
+            free(data);
+            return JSValueMakeUndefined(ctx);
+        }
+
+        // Copy data into the array
+        JSObjectRef buffer = JSObjectGetTypedArrayBuffer(ctx, array, exception);
+        if (*exception) {
+            free(data);
+            return JSValueMakeUndefined(ctx);
+        }
+
+        void* array_data = JSObjectGetTypedArrayBytesPtr(ctx, array, exception);
+        if (*exception || !array_data) {
+            free(data);
+            return JSValueMakeUndefined(ctx);
+        }
+
+        memcpy(array_data, data, file_size);
+        free(data);
+
+        return array;
+    } else {
+        // Read as text (original behavior)
+        char* content = read_file(path);
+        free(path);
+
+        if (!content) {
+            JSStringRef error_str = JSStringCreateWithUTF8CString("File not found");
+            *exception = JSValueMakeString(ctx, error_str);
+            JSStringRelease(error_str);
+            return JSValueMakeUndefined(ctx);
+        }
+
+        JSStringRef result_str = JSStringCreateWithUTF8CString(content);
+        JSValueRef result = JSValueMakeString(ctx, result_str);
+        JSStringRelease(result_str);
+        free(content);
+
+        return result;
+    }
 }
 
 // fs.writeFileSync
@@ -3092,6 +3212,27 @@ static JSObjectRef create_https_module(JSContextRef ctx) {
     JSObjectSetProperty(ctx, https, request_name, get_func, kJSPropertyAttributeNone, NULL);
     JSStringRelease(request_name);
 
+    // https.createServer() - wraps serve_https()
+    const char* createServer_code =
+        "(function() {"
+        "  return function(options, handler) {"
+        "    return {"
+        "      listen: function(port, callback) {"
+        "        serve_https(port, options, handler);"
+        "        if (callback) callback();"
+        "      }"
+        "    };"
+        "  };"
+        "})()";
+
+    JSStringRef createServer_str = JSStringCreateWithUTF8CString(createServer_code);
+    JSValueRef createServer_func = JSEvaluateScript(ctx, createServer_str, NULL, NULL, 1, NULL);
+    JSStringRelease(createServer_str);
+
+    JSStringRef createServer_name = JSStringCreateWithUTF8CString("createServer");
+    JSObjectSetProperty(ctx, https, createServer_name, createServer_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(createServer_name);
+
     return https;
 }
 
@@ -4340,6 +4481,192 @@ static void parse_http_request(const char* buffer, char* method, char* path, cha
     sscanf(buffer, "%s %s %s", method, path, version);
 }
 
+// TLS I/O Callbacks for SecureTransport
+static OSStatus tls_read_callback(SSLConnectionRef connection, void* data, size_t* dataLength) {
+    int socket_fd = *(int*)connection;
+    ssize_t result = recv(socket_fd, data, *dataLength, 0);
+
+    if (result > 0) {
+        *dataLength = result;
+        return noErr;
+    } else if (result == 0) {
+        *dataLength = 0;
+        return errSSLClosedGraceful;
+    } else {
+        *dataLength = 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return errSSLWouldBlock;
+        }
+        return errSecIO;
+    }
+}
+
+static OSStatus tls_write_callback(SSLConnectionRef connection, const void* data, size_t* dataLength) {
+    int socket_fd = *(int*)connection;
+    ssize_t result = send(socket_fd, data, *dataLength, 0);
+
+    if (result > 0) {
+        *dataLength = result;
+        return noErr;
+    } else if (result == 0) {
+        *dataLength = 0;
+        return errSSLClosedGraceful;
+    } else {
+        *dataLength = 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return errSSLWouldBlock;
+        }
+        return errSecIO;
+    }
+}
+
+// Create TLS context
+static TlsContext* create_tls_context(int socket_fd, int is_server, SecIdentityRef identity) {
+    TlsContext* ctx = malloc(sizeof(TlsContext));
+    if (!ctx) return NULL;
+
+    memset(ctx, 0, sizeof(TlsContext));
+    ctx->socket_fd = socket_fd;
+    ctx->is_server = is_server;
+    ctx->state = TLS_STATE_NONE;
+    ctx->identity = identity;
+    if (identity) CFRetain(identity);
+
+    // Create SSL context
+    ctx->ssl_ctx = SSLCreateContext(NULL, is_server ? kSSLServerSide : kSSLClientSide, kSSLStreamType);
+    if (!ctx->ssl_ctx) {
+        free(ctx);
+        return NULL;
+    }
+
+    // Set I/O callbacks
+    SSLSetIOFuncs(ctx->ssl_ctx, tls_read_callback, tls_write_callback);
+    SSLSetConnection(ctx->ssl_ctx, &ctx->socket_fd);
+
+    // Set TLS 1.2+ only
+    SSLSetProtocolVersionMin(ctx->ssl_ctx, kTLSProtocol12);
+
+    // Set identity for server
+    if (is_server && identity) {
+        CFArrayRef certs = CFArrayCreate(NULL, (const void**)&identity, 1, &kCFTypeArrayCallBacks);
+        SSLSetCertificate(ctx->ssl_ctx, certs);
+        CFRelease(certs);
+
+        // For server, don't require client certificate
+        SSLSetClientSideAuthenticate(ctx->ssl_ctx, kNeverAuthenticate);
+    }
+
+    return ctx;
+}
+
+// Destroy TLS context
+static void destroy_tls_context(TlsContext* ctx) {
+    if (!ctx) return;
+
+    if (ctx->ssl_ctx) {
+        SSLClose(ctx->ssl_ctx);
+        CFRelease(ctx->ssl_ctx);
+    }
+
+    if (ctx->identity) {
+        CFRelease(ctx->identity);
+    }
+
+    if (ctx->pending_write_data) {
+        free(ctx->pending_write_data);
+    }
+
+    free(ctx);
+}
+
+// Perform TLS handshake
+static int tls_handshake(TlsContext* ctx) {
+    fprintf(stderr, "[DEBUG] tls_handshake: state=%d\n", ctx->state);
+    if (ctx->state == TLS_STATE_CONNECTED) return 0;
+
+    ctx->state = TLS_STATE_HANDSHAKING;
+    fprintf(stderr, "[DEBUG] About to call SSLHandshake\n");
+    OSStatus status = SSLHandshake(ctx->ssl_ctx);
+    fprintf(stderr, "[DEBUG] SSLHandshake returned: %d\n", (int)status);
+
+    if (status == noErr) {
+        ctx->state = TLS_STATE_CONNECTED;
+        return 0;
+    } else if (status == errSSLWouldBlock) {
+        fprintf(stderr, "[DEBUG] Would block\n");
+        return -1;  // Need more data
+    } else {
+        fprintf(stderr, "[DEBUG] Handshake error: %d\n", (int)status);
+        ctx->state = TLS_STATE_CLOSED;
+        return -2;  // Error
+    }
+}
+
+// Read decrypted data
+static ssize_t tls_read(TlsContext* ctx, void* buffer, size_t length) {
+    if (ctx->state != TLS_STATE_CONNECTED) return -1;
+
+    size_t processed = 0;
+    OSStatus status = SSLRead(ctx->ssl_ctx, buffer, length, &processed);
+
+    if (status == noErr || status == errSSLWouldBlock) {
+        return processed;
+    }
+
+    return -1;
+}
+
+// Write encrypted data
+static ssize_t tls_write(TlsContext* ctx, const void* buffer, size_t length) {
+    if (ctx->state != TLS_STATE_CONNECTED) return -1;
+
+    size_t processed = 0;
+    OSStatus status = SSLWrite(ctx->ssl_ctx, buffer, length, &processed);
+
+    if (status == noErr || status == errSSLWouldBlock) {
+        return processed;
+    }
+
+    return -1;
+}
+
+// Load identity from .p12/.pfx file
+static SecIdentityRef load_identity_from_pfx(const char* pfx_data, size_t pfx_len, const char* passphrase) {
+    CFDataRef pfx_cf = CFDataCreate(NULL, (const UInt8*)pfx_data, pfx_len);
+    if (!pfx_cf) return NULL;
+
+    CFStringRef pass_cf = NULL;
+    if (passphrase) {
+        pass_cf = CFStringCreateWithCString(NULL, passphrase, kCFStringEncodingUTF8);
+    }
+
+    const void* keys[] = { kSecImportExportPassphrase };
+    const void* values[] = { pass_cf ? pass_cf : CFSTR("") };
+    CFDictionaryRef options = CFDictionaryCreate(NULL, keys, values, 1,
+                                                 &kCFTypeDictionaryKeyCallBacks,
+                                                 &kCFTypeDictionaryValueCallBacks);
+
+    CFArrayRef items = NULL;
+    OSStatus status = SecPKCS12Import(pfx_cf, options, &items);
+
+    CFRelease(pfx_cf);
+    if (pass_cf) CFRelease(pass_cf);
+    CFRelease(options);
+
+    if (status != noErr || !items || CFArrayGetCount(items) == 0) {
+        if (items) CFRelease(items);
+        return NULL;
+    }
+
+    CFDictionaryRef item = CFArrayGetValueAtIndex(items, 0);
+    SecIdentityRef identity = (SecIdentityRef)CFDictionaryGetValue(item, kSecImportItemIdentity);
+
+    if (identity) CFRetain(identity);
+    CFRelease(items);
+
+    return identity;
+}
+
 // serve() implementation - start HTTP server
 static JSValueRef js_serve(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
                           JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
@@ -4405,6 +4732,151 @@ static JSValueRef js_serve(JSContextRef ctx, JSObjectRef function __attribute__(
     JSValueProtect(global_ctx, handler);
 
     printf("Server listening on http://localhost:%d\n", port);
+    fflush(stdout);
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// serve_https() implementation - start HTTPS server
+static JSValueRef js_serve_https(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                 JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                 const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 3) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("serve_https() requires port, options, and handler");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int port = (int)JSValueToNumber(ctx, arguments[0], NULL);
+    JSObjectRef options = JSValueToObject(ctx, arguments[1], NULL);
+    JSObjectRef handler = JSValueToObject(ctx, arguments[2], NULL);
+
+    // Extract certificate data from options
+    JSStringRef pfx_name = JSStringCreateWithUTF8CString("pfx");
+    JSValueRef pfx_val = JSObjectGetProperty(ctx, options, pfx_name, NULL);
+    JSStringRelease(pfx_name);
+
+    if (JSValueIsUndefined(ctx, pfx_val)) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("options.pfx is required");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get pfx data (should be Buffer/Uint8Array or string)
+    char* pfx_data = NULL;
+    size_t pfx_len = 0;
+
+    JSObjectRef pfx_obj = JSValueToObject(ctx, pfx_val, NULL);
+    JSStringRef length_name = JSStringCreateWithUTF8CString("length");
+    JSValueRef length_val = JSObjectGetProperty(ctx, pfx_obj, length_name, NULL);
+    JSStringRelease(length_name);
+
+    if (!JSValueIsUndefined(ctx, length_val)) {
+        pfx_len = (size_t)JSValueToNumber(ctx, length_val, NULL);
+        pfx_data = malloc(pfx_len);
+
+        for (size_t i = 0; i < pfx_len; i++) {
+            JSValueRef byte_val = JSObjectGetPropertyAtIndex(ctx, pfx_obj, i, NULL);
+            pfx_data[i] = (char)JSValueToNumber(ctx, byte_val, NULL);
+        }
+    } else {
+        // Fallback: treat as string
+        JSStringRef pfx_str = JSValueToStringCopy(ctx, pfx_val, NULL);
+        pfx_len = JSStringGetMaximumUTF8CStringSize(pfx_str);
+        pfx_data = malloc(pfx_len);
+        JSStringGetUTF8CString(pfx_str, pfx_data, pfx_len);
+        pfx_len = strlen(pfx_data);
+        JSStringRelease(pfx_str);
+    }
+
+    // Get passphrase if provided
+    char* passphrase = NULL;
+    JSStringRef pass_name = JSStringCreateWithUTF8CString("passphrase");
+    JSValueRef pass_val = JSObjectGetProperty(ctx, options, pass_name, NULL);
+    JSStringRelease(pass_name);
+
+    if (!JSValueIsUndefined(ctx, pass_val)) {
+        JSStringRef pass_str = JSValueToStringCopy(ctx, pass_val, NULL);
+        size_t max_size = JSStringGetMaximumUTF8CStringSize(pass_str);
+        passphrase = malloc(max_size);
+        JSStringGetUTF8CString(pass_str, passphrase, max_size);
+        JSStringRelease(pass_str);
+    }
+
+    // Load identity from pfx
+    SecIdentityRef identity = load_identity_from_pfx(pfx_data, pfx_len, passphrase);
+    free(pfx_data);
+    if (passphrase) free(passphrase);
+
+    if (!identity) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Failed to load certificate from pfx");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Create socket
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        CFRelease(identity);
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Failed to create socket");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Set socket options
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Set non-blocking
+    fcntl(server_fd, F_SETFL, O_NONBLOCK);
+
+    // Bind socket
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        close(server_fd);
+        CFRelease(identity);
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), "Failed to bind to port %d", port);
+        JSStringRef error_str = JSStringCreateWithUTF8CString(error_msg);
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Listen
+    if (listen(server_fd, 10) < 0) {
+        close(server_fd);
+        CFRelease(identity);
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Failed to listen on socket");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Create TLS template context
+    TlsContext* tls_template = malloc(sizeof(TlsContext));
+    memset(tls_template, 0, sizeof(TlsContext));
+    tls_template->identity = identity;
+
+    // Add to HTTPS server list
+    HttpsServer* server = malloc(sizeof(HttpsServer));
+    server->socket_fd = server_fd;
+    server->port = port;
+    server->handler = handler;
+    server->tls_template = tls_template;
+    server->next = https_server_list;
+    https_server_list = server;
+    JSValueProtect(global_ctx, handler);
+
+    printf("HTTPS server listening on https://localhost:%d\n", port);
     fflush(stdout);
 
     return JSValueMakeUndefined(ctx);
@@ -4774,6 +5246,11 @@ void setup_http_server(JSContextRef ctx, JSObjectRef global) {
     JSObjectRef serve_func = JSObjectMakeFunctionWithCallback(ctx, serve_name, js_serve);
     JSObjectSetProperty(ctx, global, serve_name, serve_func, kJSPropertyAttributeNone, NULL);
     JSStringRelease(serve_name);
+
+    JSStringRef serve_https_name = JSStringCreateWithUTF8CString("serve_https");
+    JSObjectRef serve_https_func = JSObjectMakeFunctionWithCallback(ctx, serve_https_name, js_serve_https);
+    JSObjectSetProperty(ctx, global, serve_https_name, serve_https_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(serve_https_name);
 }
 
 void setup_test_runner(JSContextRef ctx, JSObjectRef global) {
@@ -4840,8 +5317,17 @@ void run_event_loop() {
         server = server->next;
     }
 
-    // Event loop runs if we have timers, servers, websockets, TCP sockets, or UDP sockets
-    while (timer_queue || server_list || websocket_list || tcp_socket_list || tcp_server_list || udp_socket_list) {
+    // Register HTTPS server sockets with kqueue
+    HttpsServer* https_server = https_server_list;
+    while (https_server) {
+        struct kevent kev;
+        EV_SET(&kev, https_server->socket_fd, EVFILT_READ, EV_ADD, 0, 0, https_server);
+        kevent(kq, &kev, 1, NULL, 0, NULL);
+        https_server = https_server->next;
+    }
+
+    // Event loop runs if we have timers, servers, websockets, TCP sockets, TLS sockets, or UDP sockets
+    while (timer_queue || server_list || https_server_list || websocket_list || tcp_socket_list || tcp_server_list || tls_socket_list || udp_socket_list) {
         // Calculate timeout based on next timer
         struct timespec timeout;
         timeout.tv_sec = 0;
@@ -4883,6 +5369,224 @@ void run_event_loop() {
         // Process server events
         for (int i = 0; i < nev; i++) {
                 if (events[i].filter == EVFILT_READ) {
+                    fprintf(stderr, "[DEBUG] Event %d: fd=%llu, udata=%p\n", i, events[i].ident, events[i].udata);
+
+                    // Check if this is a TLS socket (must check before casting to JSObjectRef)
+                    TlsSocket* tls_sock = NULL;
+                    for (TlsSocket* ts = tls_socket_list; ts; ts = ts->next) {
+                        if (ts == (TlsSocket*)events[i].udata) {
+                            tls_sock = ts;
+                            break;
+                        }
+                    }
+
+                    if (tls_sock) {
+                        fprintf(stderr, "[DEBUG] TLS socket event on fd %d, state %d\n", tls_sock->socket_fd, tls_sock->tls_ctx->state);
+                        // Handle TLS socket
+                        if (tls_sock->tls_ctx->state == TLS_STATE_NONE || tls_sock->tls_ctx->state == TLS_STATE_HANDSHAKING) {
+                            // Perform TLS handshake
+                            fprintf(stderr, "[DEBUG] Starting TLS handshake\n");
+                            int result = tls_handshake(tls_sock->tls_ctx);
+                            fprintf(stderr, "[DEBUG] Handshake result: %d\n", result);
+                            if (result == 0) {
+                                // Handshake complete - now we can read HTTP request
+                                tls_sock->tls_ctx->state = TLS_STATE_CONNECTED;
+                            } else if (result == -1) {
+                                // Would block - try again later
+                                drain_microtasks();
+                                continue;
+                            } else {
+                                // Handshake failed
+                                close(tls_sock->socket_fd);
+                                drain_microtasks();
+                                continue;
+                            }
+                        }
+
+                        if (tls_sock->tls_ctx->state == TLS_STATE_CONNECTED && tls_sock->is_server && tls_sock->handler) {
+                            // Read HTTP request through TLS
+                            char temp_buf[8192];
+                            ssize_t bytes_read = tls_read(tls_sock->tls_ctx, temp_buf, sizeof(temp_buf) - 1);
+
+                            if (bytes_read < 0) {
+                                // Error - close connection
+                                destroy_tls_context(tls_sock->tls_ctx);
+                                close(tls_sock->socket_fd);
+                                tls_sock->socket_fd = -1;
+                                drain_microtasks();
+                                continue;
+                            }
+
+                            if (bytes_read > 0) {
+                                temp_buf[bytes_read] = '\0';
+
+                                // Append to read buffer
+                                if (tls_sock->read_buffer_len + bytes_read < sizeof(tls_sock->read_buffer)) {
+                                    memcpy(tls_sock->read_buffer + tls_sock->read_buffer_len, temp_buf, bytes_read);
+                                    tls_sock->read_buffer_len += bytes_read;
+                                    tls_sock->read_buffer[tls_sock->read_buffer_len] = '\0';
+                                }
+
+                                // Check if we have a complete HTTP request (ends with \r\n\r\n)
+                                if (strstr(tls_sock->read_buffer, "\r\n\r\n")) {
+                                    // Parse HTTP request (similar to HTTP server)
+                                    char method[16] = {0};
+                                    char path[1024] = {0};
+                                    char version[16] = {0};
+                                    parse_http_request(tls_sock->read_buffer, method, path, version);
+
+                                    // Create request object
+                                    JSObjectRef req = JSObjectMake(global_ctx, NULL, NULL);
+
+                                    JSStringRef method_name = JSStringCreateWithUTF8CString("method");
+                                    JSStringRef method_val = JSStringCreateWithUTF8CString(method);
+                                    JSObjectSetProperty(global_ctx, req, method_name, JSValueMakeString(global_ctx, method_val), kJSPropertyAttributeNone, NULL);
+                                    JSStringRelease(method_name);
+                                    JSStringRelease(method_val);
+
+                                    JSStringRef pathname_name = JSStringCreateWithUTF8CString("pathname");
+                                    JSStringRef pathname_val = JSStringCreateWithUTF8CString(path);
+                                    JSObjectSetProperty(global_ctx, req, pathname_name, JSValueMakeString(global_ctx, pathname_val), kJSPropertyAttributeNone, NULL);
+                                    JSStringRelease(pathname_name);
+                                    JSStringRelease(pathname_val);
+
+                                    // Call handler
+                                    JSValueRef args[] = {req};
+                                    JSValueRef response = JSObjectCallAsFunction(global_ctx, tls_sock->handler, NULL, 1, args, NULL);
+
+                                    // Parse response and send via TLS
+                                    if (response && JSValueIsObject(global_ctx, response)) {
+                                        JSObjectRef response_obj = JSValueToObject(global_ctx, response, NULL);
+
+                                        // Get status
+                                        int status = 200;
+                                        JSStringRef status_name = JSStringCreateWithUTF8CString("status");
+                                        JSValueRef status_val = JSObjectGetProperty(global_ctx, response_obj, status_name, NULL);
+                                        if (!JSValueIsUndefined(global_ctx, status_val)) {
+                                            status = (int)JSValueToNumber(global_ctx, status_val, NULL);
+                                        }
+                                        JSStringRelease(status_name);
+
+                                        // Get body
+                                        JSStringRef body_name = JSStringCreateWithUTF8CString("body");
+                                        JSValueRef body_val = JSObjectGetProperty(global_ctx, response_obj, body_name, NULL);
+                                        JSStringRef body_str = JSValueToStringCopy(global_ctx, body_val, NULL);
+                                        size_t body_max = JSStringGetMaximumUTF8CStringSize(body_str);
+                                        char* body = malloc(body_max);
+                                        JSStringGetUTF8CString(body_str, body, body_max);
+                                        JSStringRelease(body_str);
+                                        JSStringRelease(body_name);
+
+                                        // Build HTTP response
+                                        char http_response[8192];
+                                        int resp_len = snprintf(http_response, sizeof(http_response),
+                                            "HTTP/1.1 %d OK\r\n"
+                                            "Content-Type: text/plain\r\n"
+                                            "Content-Length: %zu\r\n"
+                                            "Connection: close\r\n"
+                                            "\r\n"
+                                            "%s", status, strlen(body), body);
+
+                                        // Send response through TLS
+                                        tls_write(tls_sock->tls_ctx, http_response, resp_len);
+
+                                        free(body);
+                                    }
+
+                                    // Close connection after sending response
+                                    destroy_tls_context(tls_sock->tls_ctx);
+                                    close(tls_sock->socket_fd);
+                                    tls_sock->socket_fd = -1;
+                                }
+                                // If bytes_read == 0, just continue - no data yet, wait for next event
+                            }
+                        }
+
+                        drain_microtasks();
+                        continue;
+                    }
+
+                    // Check if this is an HTTPS server
+                    HttpsServer* https_srv = NULL;
+                    for (HttpsServer* hs = https_server_list; hs; hs = hs->next) {
+                        if (hs == (HttpsServer*)events[i].udata) {
+                            https_srv = hs;
+                            break;
+                        }
+                    }
+
+                    if (https_srv) {
+                        // Accept HTTPS connection
+                        struct sockaddr_in client_addr;
+                        socklen_t client_len = sizeof(client_addr);
+                        int client_fd = accept(https_srv->socket_fd, (struct sockaddr*)&client_addr, &client_len);
+
+                        if (client_fd >= 0) {
+                            fprintf(stderr, "[DEBUG] Accepted HTTPS connection on fd %d\n", client_fd);
+                            fcntl(client_fd, F_SETFL, O_NONBLOCK);
+
+                            // Create TLS context for this connection
+                            TlsContext* tls_ctx = create_tls_context(client_fd, 1, https_srv->tls_template->identity);
+                            fprintf(stderr, "[DEBUG] TLS context created: %p\n", (void*)tls_ctx);
+                            if (tls_ctx) {
+                                fprintf(stderr, "[DEBUG] About to create TLS socket wrapper\n");
+                                // Create TLS socket wrapper
+                                TlsSocket* tls_sock = malloc(sizeof(TlsSocket));
+                                fprintf(stderr, "[DEBUG] TLS socket allocated: %p\n", (void*)tls_sock);
+                                memset(tls_sock, 0, sizeof(TlsSocket));
+                                tls_sock->socket_fd = client_fd;
+                                tls_sock->tls_ctx = tls_ctx;
+                                tls_sock->is_server = 1;
+                                tls_sock->connecting = 0;
+                                tls_sock->handler = https_srv->handler;
+                                tls_sock->on_secure_connect = NULL;
+                                tls_sock->on_data = NULL;
+                                tls_sock->on_end = NULL;
+                                tls_sock->on_error = NULL;
+                                tls_sock->read_buffer_len = 0;
+                                fprintf(stderr, "[DEBUG] About to add to list\n");
+                                tls_sock->next = tls_socket_list;
+                                tls_socket_list = tls_sock;
+                                fprintf(stderr, "[DEBUG] Added to list\n");
+
+                                // Protect handler from GC
+                                JSValueProtect(global_ctx, https_srv->handler);
+                                fprintf(stderr, "[DEBUG] Protected handler\n");
+
+                                // Register socket with kqueue for TLS handshake/data
+                                struct kevent cev;
+                                fprintf(stderr, "[DEBUG] kq=%d, client_fd=%d\n", kq, client_fd);
+                                EV_SET(&cev, client_fd, EVFILT_READ, EV_ADD, 0, 0, tls_sock);
+                                fprintf(stderr, "[DEBUG] EV_SET done, about to call kevent\n");
+                                int kq_result = kevent(kq, &cev, 1, NULL, 0, NULL);
+                                fprintf(stderr, "[DEBUG] kqueue register result: %d, errno: %d, fd: %d, tls_sock: %p\n", kq_result, errno, client_fd, (void*)tls_sock);
+                                fprintf(stderr, "[DEBUG] Finished TLS socket setup\n");
+                            } else {
+                                fprintf(stderr, "[DEBUG] TLS context creation failed\n");
+                                close(client_fd);
+                            }
+                        }
+
+                        fprintf(stderr, "[DEBUG] About to drain microtasks\n");
+                        drain_microtasks();
+                        fprintf(stderr, "[DEBUG] About to continue\n");
+                        continue;
+                    }
+
+                    // Check if this is an HTTP server
+                    HttpServer* http_srv = NULL;
+                    for (HttpServer* hs = server_list; hs; hs = hs->next) {
+                        if (hs == (HttpServer*)events[i].udata) {
+                            http_srv = hs;
+                            break;
+                        }
+                    }
+
+                    if (http_srv) {
+                        // Handle HTTP server - jump to existing HTTP handling code below
+                        // (we'll keep the existing code that follows)
+                    }
+
                     JSObjectRef obj = (JSObjectRef)events[i].udata;
 
                     // Check if this is a TCP socket
@@ -5175,10 +5879,11 @@ void run_event_loop() {
                         continue;
                     }
 
-                    // Otherwise it's an HTTP server
-                    HttpServer* srv = (HttpServer*)events[i].udata;
+                    // Otherwise it's an HTTP server (if http_srv was matched above)
+                    if (http_srv) {
+                        HttpServer* srv = http_srv;
 
-                    // Accept connection
+                        // Accept connection
                     struct sockaddr_in client_addr;
                     socklen_t client_len = sizeof(client_addr);
                     int client_fd = accept(srv->socket_fd, (struct sockaddr*)&client_addr, &client_len);
@@ -5515,6 +6220,7 @@ void run_event_loop() {
 
                         close(client_fd);
                     }
+                    } // End of if (http_srv)
                 } else if (events[i].filter == EVFILT_WRITE) {
                     // Handle TCP socket connection completion
                     JSObjectRef obj = (JSObjectRef)events[i].udata;

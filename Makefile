@@ -1,5 +1,5 @@
 CC = clang
-CFLAGS = -framework JavaScriptCore -framework Security -lcurl -lz -Wall -Wextra
+CFLAGS = -framework JavaScriptCore -framework Security -framework CoreFoundation -lcurl -lz -Wall -Wextra
 TARGET = krandog
 
 all: $(TARGET)
