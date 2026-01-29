@@ -82,13 +82,13 @@ The WebSocket implementation is in `runtime.c`:
 - **Lines 5700-5806**: Event loop integration for frame processing
 - **Lines 6037-6124**: Server-side upgrade handling in HTTP server
 
-## Known Limitations
+## WebSocket Client Fix (2026-01-29)
 
-### WebSocket Client
-The built-in `new WebSocket()` client has timing issues with non-blocking sockets:
-- Connections to localhost may fail intermittently
-- Handshake send() happens before socket is writable
-- Recommended: Use external clients (`wscat`, `websocat`) for testing
+The WebSocket client timing bug has been **fixed**:
+- Client now uses kqueue EVFILT_WRITE to detect when socket is connected
+- Handshake is sent only after socket becomes writable
+- Properly handles non-blocking connect() with deferred handshake send
+- Added `handshake_buffer` and `handshake_len` fields to WebSocket struct
 
 ### Protocol Features Not Implemented
 - No SSL/TLS support (`wss://` protocol)

@@ -148,6 +148,8 @@ typedef struct WebSocket {
     char* url;
     char read_buffer[65536];
     size_t read_buffer_len;
+    char handshake_buffer[1024];  // Stores client handshake until socket is writable
+    size_t handshake_len;
     struct WebSocket* next;
 } WebSocket;
 
@@ -4083,6 +4085,7 @@ static JSObjectRef js_websocket_constructor(JSContextRef ctx, JSObjectRef constr
     ws->onclose = NULL;
     ws->url = url;
     ws->read_buffer_len = 0;
+    ws->handshake_len = 0;
     ws->next = websocket_list;
     websocket_list = ws;
 
@@ -4111,9 +4114,8 @@ static JSObjectRef js_websocket_constructor(JSContextRef ctx, JSObjectRef constr
                         kJSPropertyAttributeNone, NULL);
     JSStringRelease(readyState_name);
 
-    // Send HTTP upgrade request
-    char request[1024];
-    snprintf(request, sizeof(request),
+    // Prepare HTTP upgrade request (will be sent when socket is writable)
+    ws->handshake_len = snprintf(ws->handshake_buffer, sizeof(ws->handshake_buffer),
              "GET %s HTTP/1.1\r\n"
              "Host: %s:%d\r\n"
              "Upgrade: websocket\r\n"
@@ -4123,14 +4125,11 @@ static JSObjectRef js_websocket_constructor(JSContextRef ctx, JSObjectRef constr
              "\r\n",
              path, host, port);
 
-    // Add to kqueue
+    // Add to kqueue with WRITE filter to detect when socket is connected and writable
     struct kevent ev;
-    EV_SET(&ev, sock_fd, EVFILT_READ, EV_ADD, 0, 0, ws_obj);
+    EV_SET(&ev, sock_fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, 0, 0, ws_obj);
     kevent(kq, &ev, 1, NULL, 0, NULL);
     JSValueProtect(global_ctx, ws_obj);
-
-    // Send after a short delay to allow connection
-    send(sock_fd, request, strlen(request), 0);
 
     return ws_obj;
 }
@@ -5368,8 +5367,41 @@ void run_event_loop() {
 
         // Process server events
         for (int i = 0; i < nev; i++) {
+                // Handle WRITE events (for WebSocket client handshake)
+                if (events[i].filter == EVFILT_WRITE) {
+                    // Check if this is a WebSocket client that needs to send handshake
+                    JSObjectRef obj = (JSObjectRef)events[i].udata;
+                    WebSocket* ws = JSObjectGetPrivate(obj);
+
+                    if (ws && ws->is_client && ws->ready_state == 0 && ws->handshake_len > 0) {
+                        // Socket is now writable, send the handshake
+                        ssize_t sent = send(ws->socket_fd, ws->handshake_buffer, ws->handshake_len, 0);
+
+                        if (sent > 0) {
+                            // Handshake sent successfully
+                            ws->handshake_len = 0;  // Mark as sent
+
+                            // Switch to READ events to receive the server response
+                            struct kevent read_ev;
+                            EV_SET(&read_ev, ws->socket_fd, EVFILT_READ, EV_ADD, 0, 0, obj);
+                            kevent(kq, &read_ev, 1, NULL, 0, NULL);
+                        } else {
+                            // Send failed - trigger error
+                            if (ws->onerror) {
+                                JSObjectCallAsFunction(global_ctx, ws->onerror, obj, 0, NULL, NULL);
+                            }
+                            ws->ready_state = 3;  // CLOSED
+                            if (ws->onclose) {
+                                JSObjectCallAsFunction(global_ctx, ws->onclose, obj, 0, NULL, NULL);
+                            }
+                        }
+                    }
+
+                    drain_microtasks();
+                    continue;
+                }
+
                 if (events[i].filter == EVFILT_READ) {
-                    fprintf(stderr, "[DEBUG] Event %d: fd=%llu, udata=%p\n", i, events[i].ident, events[i].udata);
 
                     // Check if this is a TLS socket (must check before casting to JSObjectRef)
                     TlsSocket* tls_sock = NULL;
@@ -6088,6 +6120,7 @@ void run_event_loop() {
                                 ws->onclose = NULL;
                                 ws->url = NULL;
                                 ws->read_buffer_len = 0;
+                                ws->handshake_len = 0;  // Server-side doesn't need handshake
                                 ws->next = websocket_list;
                                 websocket_list = ws;
 

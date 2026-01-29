@@ -84,7 +84,7 @@ server.listen(3000);
 
 krandog provides a WebSocket client implementation compatible with the browser WebSocket API.
 
-**Note:** The built-in WebSocket client has known timing issues with non-blocking sockets that can cause connection failures when connecting to localhost servers immediately after starting them. For production use, consider using external WebSocket clients like `wscat` or `websocat` for testing, or add delays before connecting.
+The WebSocket client uses non-blocking sockets with kqueue event monitoring to properly handle connection timing. The client waits for the socket to become writable before sending the HTTP upgrade handshake.
 
 ### Basic Client Example
 
@@ -271,7 +271,6 @@ The WebSocket implementation is in `runtime.c`:
 
 Current limitations:
 
-- **WebSocket client timing:** The built-in WebSocket client may have connection issues due to non-blocking socket timing. Use external clients (`wscat`, `websocat`) for reliable testing.
 - **No SSL/TLS support:** Only `ws://` protocol supported (not `wss://`)
 - **Single-frame messages:** No fragmented message support
 - **No compression:** permessage-deflate extension not implemented
