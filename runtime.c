@@ -695,6 +695,179 @@ static JSValueRef js_fs_unlink_sync(JSContextRef ctx, JSObjectRef function __att
     return JSValueMakeUndefined(ctx);
 }
 
+// fs.statSync - get file/directory metadata
+static JSValueRef js_fs_stat_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                   JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                   const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(max_size);
+    JSStringGetUTF8CString(path_str, path, max_size);
+    JSStringRelease(path_str);
+
+    struct stat st;
+    int result = stat(path, &st);
+    free(path);
+
+    if (result != 0) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot stat file");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Create stats object
+    JSObjectRef stats = JSObjectMake(ctx, NULL, NULL);
+
+    // Add size property
+    JSStringRef size_name = JSStringCreateWithUTF8CString("size");
+    JSObjectSetProperty(ctx, stats, size_name, JSValueMakeNumber(ctx, st.st_size), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(size_name);
+
+    // Add mtime property (milliseconds since epoch)
+    JSStringRef mtime_name = JSStringCreateWithUTF8CString("mtime");
+    JSObjectRef mtime_date = JSObjectMakeDate(ctx, 1, (JSValueRef[]){JSValueMakeNumber(ctx, st.st_mtime * 1000.0)}, NULL);
+    JSObjectSetProperty(ctx, stats, mtime_name, mtime_date, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(mtime_name);
+
+    // Add mtimeMs property (milliseconds)
+    JSStringRef mtimeMs_name = JSStringCreateWithUTF8CString("mtimeMs");
+    JSObjectSetProperty(ctx, stats, mtimeMs_name, JSValueMakeNumber(ctx, st.st_mtime * 1000.0), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(mtimeMs_name);
+
+    // Add mode property
+    JSStringRef mode_name = JSStringCreateWithUTF8CString("mode");
+    JSObjectSetProperty(ctx, stats, mode_name, JSValueMakeNumber(ctx, st.st_mode), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(mode_name);
+
+    // Add isFile() method
+    const char* isFile_code = "(function() { return (this.mode & 0170000) === 0100000; })";
+    JSStringRef isFile_str = JSStringCreateWithUTF8CString(isFile_code);
+    JSValueRef isFile_val = JSEvaluateScript(ctx, isFile_str, NULL, NULL, 1, NULL);
+    JSStringRelease(isFile_str);
+    JSStringRef isFile_name = JSStringCreateWithUTF8CString("isFile");
+    JSObjectSetProperty(ctx, stats, isFile_name, isFile_val, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(isFile_name);
+
+    // Add isDirectory() method
+    const char* isDir_code = "(function() { return (this.mode & 0170000) === 0040000; })";
+    JSStringRef isDir_str = JSStringCreateWithUTF8CString(isDir_code);
+    JSValueRef isDir_val = JSEvaluateScript(ctx, isDir_str, NULL, NULL, 1, NULL);
+    JSStringRelease(isDir_str);
+    JSStringRef isDir_name = JSStringCreateWithUTF8CString("isDirectory");
+    JSObjectSetProperty(ctx, stats, isDir_name, isDir_val, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(isDir_name);
+
+    // Add isSymbolicLink() method
+    const char* isLink_code = "(function() { return (this.mode & 0170000) === 0120000; })";
+    JSStringRef isLink_str = JSStringCreateWithUTF8CString(isLink_code);
+    JSValueRef isLink_val = JSEvaluateScript(ctx, isLink_str, NULL, NULL, 1, NULL);
+    JSStringRelease(isLink_str);
+    JSStringRef isLink_name = JSStringCreateWithUTF8CString("isSymbolicLink");
+    JSObjectSetProperty(ctx, stats, isLink_name, isLink_val, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(isLink_name);
+
+    return stats;
+}
+
+// fs.renameSync - rename/move file
+static JSValueRef js_fs_rename_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                     JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                     const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 2) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get old path
+    JSStringRef oldPath_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t oldPath_size = JSStringGetMaximumUTF8CStringSize(oldPath_str);
+    char* oldPath = malloc(oldPath_size);
+    JSStringGetUTF8CString(oldPath_str, oldPath, oldPath_size);
+    JSStringRelease(oldPath_str);
+
+    // Get new path
+    JSStringRef newPath_str = JSValueToStringCopy(ctx, arguments[1], exception);
+    if (*exception) {
+        free(oldPath);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t newPath_size = JSStringGetMaximumUTF8CStringSize(newPath_str);
+    char* newPath = malloc(newPath_size);
+    JSStringGetUTF8CString(newPath_str, newPath, newPath_size);
+    JSStringRelease(newPath_str);
+
+    // Rename file
+    int result = rename(oldPath, newPath);
+    free(oldPath);
+    free(newPath);
+
+    if (result != 0) {
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot rename file");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// fs.appendFileSync - append to file
+static JSValueRef js_fs_append_file_sync(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                          JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                                          const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 2) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Get file path
+    JSStringRef path_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t path_size = JSStringGetMaximumUTF8CStringSize(path_str);
+    char* path = malloc(path_size);
+    JSStringGetUTF8CString(path_str, path, path_size);
+    JSStringRelease(path_str);
+
+    // Get data to append
+    JSStringRef data_str = JSValueToStringCopy(ctx, arguments[1], exception);
+    if (*exception) {
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t data_size = JSStringGetMaximumUTF8CStringSize(data_str);
+    char* data = malloc(data_size);
+    JSStringGetUTF8CString(data_str, data, data_size);
+    JSStringRelease(data_str);
+
+    // Open file with append flag
+    FILE* file = fopen(path, "a");
+    free(path);
+
+    if (!file) {
+        free(data);
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Cannot open file for append");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    // Write data
+    fputs(data, file);
+    fclose(file);
+    free(data);
+
+    return JSValueMakeUndefined(ctx);
+}
+
 // Queue async operation
 static void queue_async_op(AsyncOp* op) {
     op->next = NULL;
@@ -4182,6 +4355,126 @@ static JSObjectRef create_path_module(JSContextRef ctx) {
     JSStringRelease(delimiter_name);
     JSStringRelease(delimiter_value);
 
+    // path.parse - parse a path into components
+    const char* parse_code =
+        "(function(pathStr) {"
+        "  if (typeof pathStr !== 'string') throw new TypeError('Path must be a string');"
+        "  const result = { root: '', dir: '', base: '', ext: '', name: '' };"
+        "  if (pathStr.length === 0) return result;"
+        "  const isAbsolute = pathStr[0] === '/';"
+        "  if (isAbsolute) result.root = '/';"
+        "  let startIdx = isAbsolute ? 1 : 0;"
+        "  let endIdx = pathStr.length;"
+        "  let lastSlash = pathStr.lastIndexOf('/');"
+        "  if (lastSlash === -1) {"
+        "    result.base = pathStr.slice(startIdx);"
+        "  } else {"
+        "    result.dir = pathStr.slice(0, lastSlash) || (isAbsolute ? '/' : '');"
+        "    result.base = pathStr.slice(lastSlash + 1);"
+        "  }"
+        "  const lastDot = result.base.lastIndexOf('.');"
+        "  if (lastDot > 0) {"
+        "    result.name = result.base.slice(0, lastDot);"
+        "    result.ext = result.base.slice(lastDot);"
+        "  } else {"
+        "    result.name = result.base;"
+        "  }"
+        "  return result;"
+        "})";
+    JSStringRef parse_str = JSStringCreateWithUTF8CString(parse_code);
+    JSValueRef parse_val = JSEvaluateScript(ctx, parse_str, NULL, NULL, 1, NULL);
+    JSStringRelease(parse_str);
+    JSStringRef parse_name = JSStringCreateWithUTF8CString("parse");
+    JSObjectSetProperty(ctx, path, parse_name, parse_val, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(parse_name);
+
+    // path.format - format a path object into a string
+    const char* format_code =
+        "(function(pathObj) {"
+        "  if (typeof pathObj !== 'object') return '';"
+        "  let result = '';"
+        "  if (pathObj.dir) {"
+        "    result = pathObj.dir;"
+        "    if (pathObj.base) result += '/' + pathObj.base;"
+        "  } else if (pathObj.root) {"
+        "    result = pathObj.root;"
+        "    if (pathObj.base) result += pathObj.base;"
+        "  } else if (pathObj.base) {"
+        "    result = pathObj.base;"
+        "  } else if (pathObj.name) {"
+        "    result = pathObj.name + (pathObj.ext || '');"
+        "  }"
+        "  return result;"
+        "})";
+    JSStringRef format_str = JSStringCreateWithUTF8CString(format_code);
+    JSValueRef format_val = JSEvaluateScript(ctx, format_str, NULL, NULL, 1, NULL);
+    JSStringRelease(format_str);
+    JSStringRef format_name = JSStringCreateWithUTF8CString("format");
+    JSObjectSetProperty(ctx, path, format_name, format_val, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(format_name);
+
+    // path.normalize - normalize a path
+    const char* normalize_code =
+        "(function(pathStr) {"
+        "  if (typeof pathStr !== 'string') throw new TypeError('Path must be a string');"
+        "  if (pathStr.length === 0) return '.';"
+        "  const isAbsolute = pathStr[0] === '/';"
+        "  const trailingSep = pathStr[pathStr.length - 1] === '/';"
+        "  const segments = pathStr.split('/').filter(s => s.length > 0 && s !== '.');"
+        "  const result = [];"
+        "  for (const seg of segments) {"
+        "    if (seg === '..') {"
+        "      if (result.length > 0 && result[result.length - 1] !== '..') {"
+        "        result.pop();"
+        "      } else if (!isAbsolute) {"
+        "        result.push('..');"
+        "      }"
+        "    } else {"
+        "      result.push(seg);"
+        "    }"
+        "  }"
+        "  let normalized = result.join('/');"
+        "  if (isAbsolute) normalized = '/' + normalized;"
+        "  if (trailingSep && normalized.length > 1) normalized += '/';"
+        "  return normalized || (isAbsolute ? '/' : '.');"
+        "})";
+    JSStringRef normalize_str = JSStringCreateWithUTF8CString(normalize_code);
+    JSValueRef normalize_val = JSEvaluateScript(ctx, normalize_str, NULL, NULL, 1, NULL);
+    JSStringRelease(normalize_str);
+    JSStringRef normalize_name = JSStringCreateWithUTF8CString("normalize");
+    JSObjectSetProperty(ctx, path, normalize_name, normalize_val, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(normalize_name);
+
+    // path.relative - get relative path from one path to another
+    const char* relative_code =
+        "(function(from, to) {"
+        "  if (typeof from !== 'string' || typeof to !== 'string') {"
+        "    throw new TypeError('Arguments must be strings');"
+        "  }"
+        "  if (from === to) return '';"
+        "  const fromParts = from.split('/').filter(s => s.length > 0);"
+        "  const toParts = to.split('/').filter(s => s.length > 0);"
+        "  let commonLength = 0;"
+        "  const minLength = Math.min(fromParts.length, toParts.length);"
+        "  for (let i = 0; i < minLength; i++) {"
+        "    if (fromParts[i] === toParts[i]) commonLength++;"
+        "    else break;"
+        "  }"
+        "  const upCount = fromParts.length - commonLength;"
+        "  const result = [];"
+        "  for (let i = 0; i < upCount; i++) result.push('..');"
+        "  for (let i = commonLength; i < toParts.length; i++) {"
+        "    result.push(toParts[i]);"
+        "  }"
+        "  return result.join('/') || '.';"
+        "})";
+    JSStringRef relative_str = JSStringCreateWithUTF8CString(relative_code);
+    JSValueRef relative_val = JSEvaluateScript(ctx, relative_str, NULL, NULL, 1, NULL);
+    JSStringRelease(relative_str);
+    JSStringRef relative_name = JSStringCreateWithUTF8CString("relative");
+    JSObjectSetProperty(ctx, path, relative_name, relative_val, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(relative_name);
+
     return path;
 }
 
@@ -4240,6 +4533,21 @@ static JSObjectRef create_fs_module(JSContextRef ctx) {
     JSObjectRef unlinkSync_func = JSObjectMakeFunctionWithCallback(ctx, unlinkSync_name, js_fs_unlink_sync);
     JSObjectSetProperty(ctx, fs, unlinkSync_name, unlinkSync_func, kJSPropertyAttributeNone, NULL);
     JSStringRelease(unlinkSync_name);
+
+    JSStringRef statSync_name = JSStringCreateWithUTF8CString("statSync");
+    JSObjectRef statSync_func = JSObjectMakeFunctionWithCallback(ctx, statSync_name, js_fs_stat_sync);
+    JSObjectSetProperty(ctx, fs, statSync_name, statSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(statSync_name);
+
+    JSStringRef renameSync_name = JSStringCreateWithUTF8CString("renameSync");
+    JSObjectRef renameSync_func = JSObjectMakeFunctionWithCallback(ctx, renameSync_name, js_fs_rename_sync);
+    JSObjectSetProperty(ctx, fs, renameSync_name, renameSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(renameSync_name);
+
+    JSStringRef appendFileSync_name = JSStringCreateWithUTF8CString("appendFileSync");
+    JSObjectRef appendFileSync_func = JSObjectMakeFunctionWithCallback(ctx, appendFileSync_name, js_fs_append_file_sync);
+    JSObjectSetProperty(ctx, fs, appendFileSync_name, appendFileSync_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(appendFileSync_name);
 
     // Async functions
     JSStringRef readFile_name = JSStringCreateWithUTF8CString("readFile");
@@ -8119,6 +8427,45 @@ int main(int argc, char* argv[]) {
         char* error_buf = malloc(max_size);
         JSStringGetUTF8CString(error_str, error_buf, max_size);
         fprintf(stderr, "Warning: Failed to initialize Promise utilities: %s\n", error_buf);
+        free(error_buf);
+        JSStringRelease(error_str);
+    }
+
+    // Setup process.nextTick() - runs before microtasks
+    const char* next_tick_code =
+        "if (typeof process !== 'undefined' && !process.nextTick) {"
+        "  const nextTickQueue = [];"
+        "  let draining = false;"
+        "  process.nextTick = function(callback, ...args) {"
+        "    nextTickQueue.push({ callback, args });"
+        "    if (!draining) {"
+        "      draining = true;"
+        "      queueMicrotask(() => {"
+        "        draining = false;"
+        "        const queue = nextTickQueue.splice(0);"
+        "        for (const item of queue) {"
+        "          try {"
+        "            item.callback(...item.args);"
+        "          } catch (e) {"
+        "            console.error('Uncaught error in nextTick callback:', e);"
+        "          }"
+        "        }"
+        "      });"
+        "    }"
+        "  };"
+        "}";
+
+    JSStringRef next_tick_code_str = JSStringCreateWithUTF8CString(next_tick_code);
+    JSValueRef next_tick_exception = NULL;
+    JSEvaluateScript(ctx, next_tick_code_str, NULL, NULL, 1, &next_tick_exception);
+    JSStringRelease(next_tick_code_str);
+
+    if (next_tick_exception) {
+        JSStringRef error_str = JSValueToStringCopy(ctx, next_tick_exception, NULL);
+        size_t max_size = JSStringGetMaximumUTF8CStringSize(error_str);
+        char* error_buf = malloc(max_size);
+        JSStringGetUTF8CString(error_str, error_buf, max_size);
+        fprintf(stderr, "Warning: Failed to initialize process.nextTick: %s\n", error_buf);
         free(error_buf);
         JSStringRelease(error_str);
     }

@@ -62,8 +62,8 @@ macos only.
 - test runner
 - buffer (binary data)
 - fs module (sync + async + streams)
-- process (argv, env, exit)
-- path module
+- process (argv, env, exit, nextTick)
+- path module (join, resolve, parse, format, normalize, relative)
 - console (log, error, warn)
 - web apis (URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, atob, btoa)
 - __dirname, __filename
@@ -92,9 +92,12 @@ import fs from 'fs';
 // sync
 fs.readFileSync(path, 'utf8')
 fs.writeFileSync(path, data)
+fs.appendFileSync(path, data)
 fs.existsSync(path)
 fs.readdirSync(path)
 fs.mkdirSync(path)
+fs.renameSync(oldPath, newPath)
+fs.statSync(path)
 
 // async
 fs.readFile(path, (err, data) => {})
@@ -113,6 +116,11 @@ path.join('/foo', 'bar')
 path.resolve('file.txt')
 path.basename('/foo/bar.txt')
 path.dirname('/foo/bar')
+path.extname('/foo/bar.txt')
+path.parse('/foo/bar.txt')
+path.format({ dir: '/foo', base: 'bar.txt' })
+path.normalize('/foo//bar/../baz')
+path.relative('/foo/bar', '/foo/baz')
 ```
 
 ### http server

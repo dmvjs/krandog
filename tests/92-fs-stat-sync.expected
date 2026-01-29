@@ -1,0 +1,8 @@
+Directory stats:
+  size: number
+  isDirectory(): true
+  isFile(): false
+File stats:
+  size: 12
+  isDirectory(): false
+  isFile(): true

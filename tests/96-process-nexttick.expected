@@ -1,0 +1,1 @@
+Execution order: sync -> nextTick 1 -> nextTick 2 -> setTimeout

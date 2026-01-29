@@ -1,0 +1,11 @@
+path.parse:
+  root: /
+  dir: /home/user
+  base: file.txt
+  name: file
+  ext: .txt
+path.format: /home/user/file.txt
+path.normalize:
+  /foo//bar/../baz -> /foo/baz
+  /foo/./bar -> /foo/bar
+path.relative: ../baz/file.txt
