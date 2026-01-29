@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>
+#include <curl/curl.h>
 
 // Module cache
 static JSObjectRef module_cache = NULL;
@@ -27,6 +28,13 @@ static char* read_file(const char* path);
 // Store argc/argv for process object
 static int global_argc = 0;
 static char** global_argv = NULL;
+
+// HTTP response data
+typedef struct {
+    char* data;
+    size_t size;
+    int status;
+} HttpResponse;
 
 // Microtask queue
 typedef struct Microtask {
@@ -805,6 +813,169 @@ static JSValueRef js_console_log(JSContextRef ctx, JSObjectRef function __attrib
     return JSValueMakeUndefined(ctx);
 }
 
+// HTTP write callback
+static size_t http_write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t real_size = size * nmemb;
+    HttpResponse* response = (HttpResponse*)userp;
+
+    char* ptr = realloc(response->data, response->size + real_size + 1);
+    if (!ptr) return 0;
+
+    response->data = ptr;
+    memcpy(&(response->data[response->size]), contents, real_size);
+    response->size += real_size;
+    response->data[response->size] = 0;
+
+    return real_size;
+}
+
+// Response.text() implementation
+static JSValueRef js_response_text(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                    JSObjectRef thisObject, size_t argumentCount __attribute__((unused)),
+                                    const JSValueRef arguments[] __attribute__((unused)), JSValueRef* exception __attribute__((unused))) {
+    JSStringRef body_name = JSStringCreateWithUTF8CString("_body");
+    JSValueRef body_value = JSObjectGetProperty(ctx, thisObject, body_name, NULL);
+    JSStringRelease(body_name);
+
+    // Store body value in global temporarily
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSStringRef temp_name = JSStringCreateWithUTF8CString("__temp_body");
+    JSObjectSetProperty(ctx, global, temp_name, body_value, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(temp_name);
+
+    // Create promise using eval
+    JSStringRef code = JSStringCreateWithUTF8CString("Promise.resolve(__temp_body)");
+    JSValueRef result = JSEvaluateScript(ctx, code, NULL, NULL, 1, NULL);
+    JSStringRelease(code);
+
+    return result;
+}
+
+// Response.json() implementation
+static JSValueRef js_response_json(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                                    JSObjectRef thisObject, size_t argumentCount __attribute__((unused)),
+                                    const JSValueRef arguments[] __attribute__((unused)), JSValueRef* exception) {
+    JSStringRef body_name = JSStringCreateWithUTF8CString("_body");
+    JSValueRef body_value = JSObjectGetProperty(ctx, thisObject, body_name, NULL);
+    JSStringRelease(body_name);
+
+    // Store body in global temporarily
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSStringRef temp_name = JSStringCreateWithUTF8CString("__temp_body");
+    JSObjectSetProperty(ctx, global, temp_name, body_value, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(temp_name);
+
+    // Parse and return promise
+    JSStringRef code = JSStringCreateWithUTF8CString("Promise.resolve(JSON.parse(__temp_body))");
+    JSValueRef result = JSEvaluateScript(ctx, code, NULL, NULL, 1, exception);
+    JSStringRelease(code);
+
+    return result;
+}
+
+// fetch() implementation
+static JSValueRef js_fetch(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
+                           JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
+                           const JSValueRef arguments[], JSValueRef* exception) {
+    if (argumentCount < 1) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef url_str = JSValueToStringCopy(ctx, arguments[0], exception);
+    if (*exception) return JSValueMakeUndefined(ctx);
+
+    size_t max_size = JSStringGetMaximumUTF8CStringSize(url_str);
+    char* url = malloc(max_size);
+    JSStringGetUTF8CString(url_str, url, max_size);
+    JSStringRelease(url_str);
+
+    // Initialize response
+    HttpResponse response = {0};
+    response.data = malloc(1);
+    response.size = 0;
+
+    // Initialize curl
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        free(url);
+        free(response.data);
+        JSStringRef error_str = JSStringCreateWithUTF8CString("Failed to initialize HTTP client");
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&response);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "krandog/0.1.0");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+
+    if (res != CURLE_OK) {
+        curl_easy_cleanup(curl);
+        free(url);
+        free(response.data);
+        JSStringRef error_str = JSStringCreateWithUTF8CString(curl_easy_strerror(res));
+        *exception = JSValueMakeString(ctx, error_str);
+        JSStringRelease(error_str);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    long status_code;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+    response.status = (int)status_code;
+
+    curl_easy_cleanup(curl);
+    free(url);
+
+    // Create Response object
+    JSObjectRef response_obj = JSObjectMake(ctx, NULL, NULL);
+
+    // response.status
+    JSStringRef status_name = JSStringCreateWithUTF8CString("status");
+    JSObjectSetProperty(ctx, response_obj, status_name, JSValueMakeNumber(ctx, response.status), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(status_name);
+
+    // response.ok
+    JSStringRef ok_name = JSStringCreateWithUTF8CString("ok");
+    JSObjectSetProperty(ctx, response_obj, ok_name, JSValueMakeBoolean(ctx, response.status >= 200 && response.status < 300), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(ok_name);
+
+    // response._body (internal)
+    JSStringRef body_name = JSStringCreateWithUTF8CString("_body");
+    JSStringRef body_str = JSStringCreateWithUTF8CString(response.data);
+    JSObjectSetProperty(ctx, response_obj, body_name, JSValueMakeString(ctx, body_str), kJSPropertyAttributeNone, NULL);
+    JSStringRelease(body_name);
+    JSStringRelease(body_str);
+    free(response.data);
+
+    // response.text()
+    JSStringRef text_name = JSStringCreateWithUTF8CString("text");
+    JSObjectRef text_func = JSObjectMakeFunctionWithCallback(ctx, text_name, js_response_text);
+    JSObjectSetProperty(ctx, response_obj, text_name, text_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(text_name);
+
+    // response.json()
+    JSStringRef json_name = JSStringCreateWithUTF8CString("json");
+    JSObjectRef json_func = JSObjectMakeFunctionWithCallback(ctx, json_name, js_response_json);
+    JSObjectSetProperty(ctx, response_obj, json_name, json_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(json_name);
+
+    // Store response in global temporarily and return promise
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSStringRef temp_name = JSStringCreateWithUTF8CString("__temp_response");
+    JSObjectSetProperty(ctx, global, temp_name, response_obj, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(temp_name);
+
+    JSStringRef code = JSStringCreateWithUTF8CString("Promise.resolve(__temp_response)");
+    JSValueRef result = JSEvaluateScript(ctx, code, NULL, NULL, 1, NULL);
+    JSStringRelease(code);
+
+    return result;
+}
+
 // process.exit
 static JSValueRef js_process_exit(JSContextRef ctx, JSObjectRef function __attribute__((unused)),
                                    JSObjectRef thisObject __attribute__((unused)), size_t argumentCount,
@@ -1429,10 +1600,19 @@ int main(int argc, char* argv[]) {
     strncpy(current_dir, script_dir, PATH_MAX);
     free(script_dir_path);
 
+    // Initialize curl globally
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     // Setup runtime APIs
     setup_console(ctx, global);
     setup_timers(ctx, global);
     setup_process(ctx, global);
+
+    // Setup fetch
+    JSStringRef fetch_name = JSStringCreateWithUTF8CString("fetch");
+    JSObjectRef fetch_func = JSObjectMakeFunctionWithCallback(ctx, fetch_name, js_fetch);
+    JSObjectSetProperty(ctx, global, fetch_name, fetch_func, kJSPropertyAttributeNone, NULL);
+    JSStringRelease(fetch_name);
 
     // Setup __krandog_import for module loading
     JSStringRef import_name = JSStringCreateWithUTF8CString("__krandog_import");
@@ -1474,6 +1654,9 @@ int main(int argc, char* argv[]) {
 
     // Run event loop to process timers
     run_event_loop();
+
+    // Cleanup
+    curl_global_cleanup();
 
     JSGlobalContextRelease(ctx);
     return 0;
